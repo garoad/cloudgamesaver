@@ -12,8 +12,13 @@ use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
 
-const APP_KEY: &str = "xgmmsbihoouw5pe";
-const APP_SECRET: &str = "sjshe1fig8tr9ma";
+fn get_app_key() -> String {
+    option_env!("APP_KEY").unwrap_or("").to_string()
+}
+
+fn get_app_secret() -> String {
+    option_env!("APP_SECRET").unwrap_or("").to_string()
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SyncItem {
@@ -60,7 +65,7 @@ fn open_auth_url(app: AppHandle) -> Result<(), String> {
     let redirect_uri = "http://localhost:8421/callback";
     let auth_url = format!(
         "https://www.dropbox.com/oauth2/authorize?client_id={}&response_type=code&redirect_uri={}",
-        APP_KEY, redirect_uri
+        get_app_key(), redirect_uri
     );
     let app_handle = app.clone();
     thread::spawn(move || {
@@ -96,7 +101,7 @@ async fn pick_folder_dialog<R: Runtime>(app: AppHandle<R>) -> Result<Option<Stri
 async fn exchange_code_for_token(code: String) -> Result<String, String> {
     let client = Client::new();
     let res = client.post("https://api.dropboxapi.com/oauth2/token")
-        .form(&[("code", code.as_str()), ("grant_type", "authorization_code"), ("client_id", APP_KEY), ("client_secret", APP_SECRET), ("redirect_uri", "http://localhost:8421/callback")])
+        .form(&[("code", code.as_str()), ("grant_type", "authorization_code"), ("client_id", get_app_key().as_str()), ("client_secret", get_app_secret().as_str()), ("redirect_uri", "http://localhost:8421/callback")])
         .send().await.map_err(|e| e.to_string())?;
     if res.status().is_success() {
         let token_data: TokenResponse = res.json().await.map_err(|e| e.to_string())?;

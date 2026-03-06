@@ -47,6 +47,8 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_KEY: ${{ secrets.APP_KEY }}
+          APP_SECRET: ${{ secrets.APP_SECRET }}
         with:
           tagName: app-v__VERSION__ # tauri.conf.json의 버전을 따라감
           releaseName: "CloudGameSaver v__VERSION__"

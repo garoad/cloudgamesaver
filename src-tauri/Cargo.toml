@@ -23,6 +23,7 @@ strip = true
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+dotenvy = "0.15"
 
 [dependencies]
 tauri = { version = "2", features = ["image-png", "image-ico"] }
