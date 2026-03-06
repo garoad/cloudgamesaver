@@ -71,6 +71,10 @@ npm run tauri build
 npm run tauri build
 ```
 
+## 📄 라이선스
+
+이 프로젝트는 **MIT License**를 따릅니다. 자세한 내용은 [LICENSE](LICENSE) 파일을 참조하세요.
+
 ---
 <div align="center">
   <p>© 2026 CloudGameSaver Team. All rights reserved.</p>
