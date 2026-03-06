@@ -77,5 +77,5 @@ npm run tauri build
 
 ---
 <div align="center">
-  <p>© 2026 CloudGameSaver Team. All rights reserved.</p>
+  <p>© 2026 TeamKuma. All rights reserved.</p>
 </div>
