@@ -27,7 +27,7 @@
 ## 📂 폴더 구조
 
 ```text
-cloudsaver/
+cloudgamesaver/
 ├── src/                # React (TypeScript) 프론트엔드 코드
 ├── src-tauri/          # Rust 백엔드 코드
 │   ├── src/            # 동기화 로직 및 Dropbox API 연동
