@@ -8,6 +8,7 @@ interface SyncItem {
   local_path: string;
   cloud_path: string;
   token: string;
+  enabled: boolean;
 }
 
 export default function App() {
@@ -24,7 +25,18 @@ export default function App() {
   useEffect(() => {
     const saved = localStorage.getItem("sync-items");
     const token = localStorage.getItem("dropbox-token");
-    if (saved) try { setItems(JSON.parse(saved)); } catch (e) {}
+    if (saved) {
+      try { 
+        const parsed = JSON.parse(saved);
+        const migrated = parsed.map((item: any) => ({
+          ...item,
+          enabled: item.enabled !== undefined ? item.enabled : true
+        }));
+        setItems(migrated); 
+      } catch (e) {
+        console.error("Failed to load saved items", e);
+      }
+    }
     if (token) setDropboxToken(token);
 
     const unConnect = listen("dropbox-code-received", async (event: any) => {
@@ -64,7 +76,7 @@ export default function App() {
       const cloudItems: SyncItem[] = folders.map(path => {
         const name = path.split('/').pop() || path;
         const existing = currentItems.find(i => i.cloud_path === path);
-        return existing || { name, local_path: "", cloud_path: path, token };
+        return existing || { name, local_path: "", cloud_path: path, token, enabled: true };
       });
       const manualItems = currentItems.filter(i => !folders.includes(i.cloud_path));
       const finalItems = [...cloudItems, ...manualItems];
@@ -80,6 +92,13 @@ export default function App() {
   const handleConnect = async () => {
     setStatus("인증 진행 중...");
     try { await invoke("open_auth_url"); } catch (e) { setStatus("에러: " + e); }
+  };
+
+  const toggleItem = (index: number) => {
+    const newItems = [...items];
+    newItems[index].enabled = !newItems[index].enabled;
+    setItems(newItems);
+    localStorage.setItem("sync-items", JSON.stringify(newItems));
   };
 
   const pickLocalFolder = async (index?: number) => {
@@ -103,15 +122,15 @@ export default function App() {
     if (!newName || !manualLocalPath || !dropboxToken) return alert("정보를 입력하세요.");
     const autoCloudPath = `/${newName.trim()}`;
     if (items.some(i => i.cloud_path === autoCloudPath)) return alert("이미 존재합니다.");
-    const newItems = [...items, { name: newName.trim(), local_path: manualLocalPath, cloud_path: autoCloudPath, token: dropboxToken }];
+    const newItems = [...items, { name: newName.trim(), local_path: manualLocalPath, cloud_path: autoCloudPath, token: dropboxToken, enabled: true }];
     setItems(newItems);
     localStorage.setItem("sync-items", JSON.stringify(newItems));
     setNewName(""); setManualLocalPath("");
   };
 
   const syncAll = async () => {
-    const validItems = items.filter(i => i.local_path !== "");
-    if (validItems.length === 0) return alert("연결된 폴더가 없습니다.");
+    const validItems = items.filter(i => i.local_path !== "" && i.enabled);
+    if (validItems.length === 0) return alert("동기화할 항목이 없거나 활성화된 게임이 없습니다.");
     setLoading(true);
     setProgress(0);
     setCurrentFile("파일 분석 중...");
@@ -166,11 +185,23 @@ export default function App() {
       <div className="list-section">
         <h3>관리 목록</h3>
         {items.map((item, i) => (
-          <div key={i} className={`sync-item-card ${item.local_path ? 'active' : ''}`}>
-            <div className="item-details">
-              <strong>{item.name}</strong>
-              <small>Cloud: {item.cloud_path}</small>
-              <small className="path-display">Local: {item.local_path || "⚠️ 연결되지 않음"}</small>
+          <div key={i} className={`sync-item-card ${item.local_path ? 'active' : ''} ${!item.enabled ? 'disabled' : ''}`}>
+            <div className="item-main">
+              <div className="toggle-wrapper">
+                <label className="switch">
+                  <input 
+                    type="checkbox" 
+                    checked={item.enabled} 
+                    onChange={() => toggleItem(i)} 
+                  />
+                  <span className="slider round"></span>
+                </label>
+              </div>
+              <div className="item-details">
+                <strong>{item.name}</strong>
+                <small>Cloud: {item.cloud_path}</small>
+                <small className="path-display">Local: {item.local_path || "⚠️ 연결되지 않음"}</small>
+              </div>
             </div>
             <div style={{display: "flex", gap: "5px"}}>
               <button onClick={() => pickLocalFolder(i)} className="secondary-btn">연결</button>
@@ -186,7 +217,7 @@ export default function App() {
       </div>
 
       <div className="action-section">
-        <button className="sync-btn" onClick={syncAll} disabled={items.filter(i=>i.local_path!=="").length === 0 || loading}>동기화 시작</button>
+        <button className="sync-btn" onClick={syncAll} disabled={items.filter(i=>i.local_path!=="" && i.enabled).length === 0 || loading}>동기화 시작</button>
         <div className="status-box"><pre>{status || "준비 완료"}</pre></div>
       </div>
     </div>

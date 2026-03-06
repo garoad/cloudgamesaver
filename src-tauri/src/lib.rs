@@ -1,9 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use chrono::{DateTime, Utc};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::collections::HashSet;
 use std::thread;
@@ -12,7 +10,6 @@ use url::Url;
 use tauri::{AppHandle, Runtime, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
-use rayon::prelude::*;
 use std::sync::{Arc, Mutex};
 
 const APP_KEY: &str = "xgmmsbihoouw5pe";
@@ -24,6 +21,7 @@ pub struct SyncItem {
     local_path: String,
     cloud_path: String,
     token: String,
+    enabled: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,137 +93,144 @@ async fn pick_folder_dialog<R: Runtime>(app: AppHandle<R>) -> Result<Option<Stri
 }
 
 #[tauri::command]
-fn exchange_code_for_token(code: String) -> Result<String, String> {
+async fn exchange_code_for_token(code: String) -> Result<String, String> {
     let client = Client::new();
     let res = client.post("https://api.dropboxapi.com/oauth2/token")
         .form(&[("code", code.as_str()), ("grant_type", "authorization_code"), ("client_id", APP_KEY), ("client_secret", APP_SECRET), ("redirect_uri", "http://localhost:8421/callback")])
-        .send().map_err(|e| e.to_string())?;
+        .send().await.map_err(|e| e.to_string())?;
     if res.status().is_success() {
-        let token_data: TokenResponse = res.json().map_err(|e| e.to_string())?;
+        let token_data: TokenResponse = res.json().await.map_err(|e| e.to_string())?;
         Ok(token_data.access_token)
     } else {
-        Err(res.text().unwrap_or_else(|_| "토큰 교환 실패".to_string()))
+        Err(res.text().await.unwrap_or_else(|_| "토큰 교환 실패".to_string()))
     }
 }
 
 #[tauri::command]
-fn list_dropbox_folders(token: String) -> Result<Vec<String>, String> {
+async fn list_dropbox_folders(token: String) -> Result<Vec<String>, String> {
     let client = Client::new();
     let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({"path": ""})).send().map_err(|e| e.to_string())?;
+        .json(&serde_json::json!({"path": ""})).send().await.map_err(|e| e.to_string())?;
     if res.status().is_success() {
-        let list: DropboxListResponse = res.json().map_err(|e| e.to_string())?;
+        let list: DropboxListResponse = res.json().await.map_err(|e| e.to_string())?;
         Ok(list.entries.into_iter().filter(|e| e.tag == "folder").map(|e| e.path_display.unwrap_or_else(|| format!("/{}", e.name))).collect())
     } else { Err("목록 조회 실패".to_string()) }
 }
 
-fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Vec<DropboxEntry> {
+async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Vec<DropboxEntry> {
     let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({"path": path})).send();
+        .json(&serde_json::json!({"path": path})).send().await;
     match res {
         Ok(r) => {
-            let list: DropboxListResponse = r.json().unwrap_or(DropboxListResponse { entries: Vec::new() });
+            let list: DropboxListResponse = r.json().await.unwrap_or(DropboxListResponse { entries: Vec::new() });
             list.entries.into_iter().filter(|e| e.tag == "file").collect()
         }
         Err(_) => Vec::new(),
     }
 }
 
-fn upload_to_dropbox(client: &Client, token: &str, local_file: &Path, remote_path: &str) -> Result<(), String> {
-    let mut file = fs::File::open(local_file).map_err(|e| e.to_string())?;
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents).map_err(|e| e.to_string())?;
+async fn upload_to_dropbox(client: &Client, token: &str, local_file: PathBuf, remote_path: String) -> Result<(), String> {
+    let contents = tokio::fs::read(&local_file).await.map_err(|e| e.to_string())?;
     client.post("https://content.dropboxapi.com/2/files/upload")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .header("Dropbox-API-Arg", serde_json::to_string(&serde_json::json!({"path": remote_path, "mode": "overwrite", "mute": true})).unwrap())
-        .body(contents).send().map_err(|e| e.to_string())?;
+        .body(contents).send().await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn download_from_dropbox(client: &Client, token: &str, remote_path: &str, local_file: &Path) -> Result<(), String> {
+async fn download_from_dropbox(client: &Client, token: &str, remote_path: String, local_file: PathBuf) -> Result<(), String> {
     let res = client.post("https://content.dropboxapi.com/2/files/download")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header("Dropbox-API-Arg", serde_json::to_string(&serde_json::json!({"path": remote_path})).unwrap())
-        .send().map_err(|e| e.to_string())?;
-    let contents = res.bytes().map_err(|e| e.to_string())?;
-    fs::write(local_file, contents).map_err(|e| e.to_string())?;
+        .send().await.map_err(|e| e.to_string())?;
+    let contents = res.bytes().await.map_err(|e| e.to_string())?;
+    tokio::fs::write(&local_file, contents).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
 #[tauri::command]
 async fn sync_folders(app: AppHandle, items: Vec<SyncItem>) -> SyncResult {
     let messages = Arc::new(Mutex::new(Vec::new()));
-    let total_files = Arc::new(Mutex::new(0));
     let processed_count = Arc::new(Mutex::new(0));
-
-    items.par_iter().for_each(|item| {
-        let client = Client::new();
-        let remote_files = list_dropbox_files(&client, &item.token, &item.cloud_path);
-        let mut count = remote_files.len();
-        if let Ok(entries) = fs::read_dir(&item.local_path) {
-            count += entries.filter_map(|e| e.ok()).filter(|e| !e.path().is_dir()).count();
+    let client = Client::new();
+    
+    // 분석 단계 (비동기)
+    let mut total_files_count = 0;
+    for item in &items {
+        let remote_files = list_dropbox_files(&client, &item.token, &item.cloud_path).await;
+        total_files_count += remote_files.len();
+        if let Ok(mut entries) = tokio::fs::read_dir(&item.local_path).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                if entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                    total_files_count += 1;
+                }
+            }
         }
-        let mut total = total_files.lock().unwrap();
-        *total += count;
-    });
+    }
 
-    let total_denominator = *total_files.lock().unwrap() as f32;
+    let total_denominator = total_files_count as f32;
 
-    items.into_par_iter().for_each(|item| {
-        let client = Client::new();
+    for item in items {
         let local_dir = PathBuf::from(&item.local_path);
-        if !local_dir.exists() { fs::create_dir_all(&local_dir).ok(); }
-        let remote_files = list_dropbox_files(&client, &item.token, &item.cloud_path);
+        if !local_dir.exists() { let _ = tokio::fs::create_dir_all(&local_dir).await; }
+        
+        let remote_files = list_dropbox_files(&client, &item.token, &item.cloud_path).await;
         let remote_file_names: HashSet<String> = remote_files.iter().map(|e| e.name.clone()).collect();
         
-        remote_files.into_par_iter().for_each(|remote_file| {
+        for remote_file in remote_files {
             let file_name = remote_file.name.clone();
             let local_path = local_dir.join(&file_name);
             let remote_path = format!("{}/{}", item.cloud_path.trim_end_matches('/'), file_name);
             let remote_modified = DateTime::parse_from_rfc3339(remote_file.server_modified.as_ref().unwrap()).unwrap().with_timezone(&Utc);
+            
             {
                 let mut p = processed_count.lock().unwrap();
                 *p += 1;
                 let progress = if total_denominator > 0.0 { *p as f32 / total_denominator } else { 1.0 };
                 let _ = app.emit("sync-progress", ProgressPayload { current_file: file_name.clone(), progress });
             }
+
             if !local_path.exists() {
-                download_from_dropbox(&client, &item.token, &remote_path, &local_path).ok();
+                let _ = download_from_dropbox(&client, &item.token, remote_path, local_path).await;
             } else {
-                let local_modified: DateTime<Utc> = fs::metadata(&local_path).unwrap().modified().unwrap().into();
-                if remote_modified > local_modified + chrono::Duration::seconds(1) {
-                    download_from_dropbox(&client, &item.token, &remote_path, &local_path).ok();
-                } else if local_modified > remote_modified + chrono::Duration::seconds(1) {
-                    upload_to_dropbox(&client, &item.token, &local_path, &remote_path).ok();
+                if let Ok(metadata) = tokio::fs::metadata(&local_path).await {
+                    if let Ok(modified) = metadata.modified() {
+                        let local_modified: DateTime<Utc> = modified.into();
+                        if remote_modified > local_modified + chrono::Duration::seconds(1) {
+                            let _ = download_from_dropbox(&client, &item.token, remote_path, local_path).await;
+                        } else if local_modified > remote_modified + chrono::Duration::seconds(1) {
+                            let _ = upload_to_dropbox(&client, &item.token, local_path, remote_path).await;
+                        }
+                    }
                 }
             }
-        });
+        }
 
-        if let Ok(entries) = fs::read_dir(&local_dir) {
-            let local_files: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            local_files.into_par_iter().for_each(|e| {
-                let path = e.path();
-                if path.is_dir() { return; }
+        if let Ok(mut entries) = tokio::fs::read_dir(&local_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() { continue; }
                 let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
-                {
-                    let mut p = processed_count.lock().unwrap();
-                    *p += 1;
-                    let progress = if total_denominator > 0.0 { *p as f32 / total_denominator } else { 1.0 };
-                    let _ = app.emit("sync-progress", ProgressPayload { current_file: file_name.clone(), progress });
-                }
+                
                 if !remote_file_names.contains(&file_name) {
+                    {
+                        let mut p = processed_count.lock().unwrap();
+                        *p += 1;
+                        let progress = if total_denominator > 0.0 { *p as f32 / total_denominator } else { 1.0 };
+                        let _ = app.emit("sync-progress", ProgressPayload { current_file: file_name.clone(), progress });
+                    }
                     let remote_path = format!("{}/{}", item.cloud_path.trim_end_matches('/'), file_name);
-                    upload_to_dropbox(&client, &item.token, &path, &remote_path).ok();
+                    let _ = upload_to_dropbox(&client, &item.token, path, remote_path).await;
                 }
-            });
+            }
         }
         messages.lock().unwrap().push(format!("{}: 동기화 완료!", item.name));
-    });
+    }
 
     let final_message = messages.lock().unwrap().join("\n");
     SyncResult { success: true, message: final_message }
