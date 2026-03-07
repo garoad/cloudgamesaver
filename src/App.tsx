@@ -1,8 +1,9 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
+import { ask, message } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 interface SyncItem {
@@ -18,47 +19,79 @@ export default function App() {
   const [dropboxToken, setDropboxToken] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
   const [progress, setProgress] = useState(0);
   const [currentFile, setCurrentFile] = useState("");
 
   const [newName, setNewName] = useState("");
   const [manualLocalPath, setManualLocalPath] = useState("");
+  
+  const hasCheckedUpdate = useRef(false);
+
+  // 토큰 만료 처리 함수
+  const handleTokenExpiration = async () => {
+    setDropboxToken("");
+    localStorage.removeItem("dropbox-token");
+    setStatus("세션이 만료되었습니다. 드롭박스를 다시 연결해주세요.");
+    await message("드롭박스 인증 세션이 만료되었습니다. 보안을 위해 다시 연결이 필요합니다.", { title: '알림', kind: 'warning' });
+  };
+
+  // 업데이트 확인 로직
+  const checkForUpdates = async (manual = false) => {
+    if (loading) return;
+    try {
+      if (manual) setStatus("업데이트 확인 중...");
+      const update = await check();
+      if (update) {
+        if (manual) setStatus(""); 
+        const shouldUpdate = await ask(
+          `새로운 버전(${update.version})이 있습니다. 업데이트하시겠습니까?\n\n내용: ${update.body}`,
+          { title: '업데이트 알림', kind: 'info' }
+        );
+        if (shouldUpdate) {
+          setLoading(true);
+          setIsUpdating(true);
+          setProgress(0);
+          let downloaded = 0;
+          let contentLength = 0;
+          await update.downloadAndInstall((event) => {
+            switch (event.event) {
+              case 'Started':
+                contentLength = event.data.contentLength || 0;
+                setStatus("업데이트 다운로드 중...");
+                break;
+              case 'Progress':
+                downloaded += event.data.chunkLength;
+                if (contentLength > 0) setProgress((downloaded / contentLength) * 100);
+                break;
+              case 'Finished':
+                setStatus("업데이트 완료! 재시작합니다.");
+                break;
+            }
+          });
+          await relaunch();
+        }
+      } else {
+        if (manual) await message("현재 최신 버전을 사용 중입니다.", { title: '업데이트 확인', kind: 'info' });
+      }
+    } catch (e) {
+      console.error("Update check error:", e);
+      const errorStr = String(e);
+      if (manual && !errorStr.includes("404") && !errorStr.includes("Download request failed")) {
+        await message(`업데이트 확인 중 오류가 발생했습니다: ${e}`, { title: '에러', kind: 'error' });
+      }
+    } finally {
+      setLoading(false);
+      setIsUpdating(false);
+      if (manual) setStatus("");
+    }
+  };
 
   useEffect(() => {
-    // 업데이트 확인
-    const checkForUpdates = async () => {
-      try {
-        const update = await check();
-        if (update) {
-          console.log(`Update found: ${update.version}`);
-          if (confirm(`새로운 버전(${update.version})이 있습니다. 업데이트하시겠습니까?\n\n내용: ${update.body}`)) {
-            let downloaded = 0;
-            let contentLength = 0;
-            await update.downloadAndInstall((event) => {
-              switch (event.event) {
-                case 'Started':
-                  contentLength = event.data.contentLength || 0;
-                  setStatus("업데이트 다운로드 중...");
-                  break;
-                case 'Progress':
-                  downloaded += event.data.chunkLength;
-                  if (contentLength > 0) {
-                    setProgress((downloaded / contentLength) * 100);
-                  }
-                  break;
-                case 'Finished':
-                  setStatus("업데이트 완료! 재시작합니다.");
-                  break;
-              }
-            });
-            await relaunch();
-          }
-        }
-      } catch (e) {
-        console.error("Update check failed", e);
-      }
-    };
-    checkForUpdates();
+    if (!hasCheckedUpdate.current) {
+      hasCheckedUpdate.current = true;
+      setTimeout(() => checkForUpdates(false), 1000);
+    }
 
     const saved = localStorage.getItem("sync-items");
     const token = localStorage.getItem("dropbox-token");
@@ -70,27 +103,21 @@ export default function App() {
           enabled: item.enabled !== undefined ? item.enabled : true
         }));
         setItems(migrated); 
-      } catch (e) {
-        console.error("Failed to load saved items", e);
-      }
+      } catch (e) { console.error("Failed to load saved items", e); }
     }
     if (token) setDropboxToken(token);
 
     const unConnect = listen("dropbox-code-received", async (event: any) => {
-      const code = event.payload as string;
       setLoading(true);
       setStatus("토큰 발급 중...");
       try {
-        const token: string = await invoke("exchange_code_for_token", { code });
+        const token: string = await invoke("exchange_code_for_token", { code: event.payload as string });
         setDropboxToken(token);
         localStorage.setItem("dropbox-token", token);
         setStatus("연결 성공!");
         await fetchCloudFolders(token);
-      } catch (e) {
-        setStatus("연결 실패: " + e);
-      } finally {
-        setLoading(false);
-      }
+      } catch (e) { setStatus("연결 실패: " + e); }
+      finally { setLoading(false); }
     });
 
     const unProgress = listen("sync-progress", (event: any) => {
@@ -107,20 +134,32 @@ export default function App() {
 
   const fetchCloudFolders = async (token: string) => {
     setLoading(true);
+    setStatus("클라우드 목록 가져오는 중...");
     try {
       const folders: string[] = await invoke("list_dropbox_folders", { token });
-      const currentItems = [...items];
-      const cloudItems: SyncItem[] = folders.map(path => {
-        const name = path.split('/').pop() || path;
-        const existing = currentItems.find(i => i.cloud_path === path);
-        return existing || { name, local_path: "", cloud_path: path, token, enabled: true };
+      
+      setItems(prevItems => {
+        const existingCloudPaths = new Set(prevItems.map(i => i.cloud_path));
+        const newCloudItems: SyncItem[] = folders
+          .filter(path => !existingCloudPaths.has(path))
+          .map(path => {
+            const name = path.split('/').pop() || path;
+            return { name, local_path: "", cloud_path: path, token, enabled: true };
+          });
+        const updatedItems = [...prevItems, ...newCloudItems];
+        localStorage.setItem("sync-items", JSON.stringify(updatedItems));
+        if (newCloudItems.length > 0) setStatus(`${newCloudItems.length}개의 새로운 게임이 발견되었습니다.`);
+        else setStatus("이미 모든 클라우드 게임이 목록에 있습니다.");
+        return updatedItems;
       });
-      const manualItems = currentItems.filter(i => !folders.includes(i.cloud_path));
-      const finalItems = [...cloudItems, ...manualItems];
-      setItems(finalItems);
-      localStorage.setItem("sync-items", JSON.stringify(finalItems));
     } catch (e) {
-      setStatus("목록 가져오기 실패: " + e);
+      const errStr = String(e);
+      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token")) {
+        await handleTokenExpiration();
+      } else {
+        setStatus("목록 가져오기 실패: " + e);
+        await message(`클라우드 목록을 가져오지 못했습니다: ${e}`, { kind: 'error' });
+      }
     } finally {
       setLoading(false);
     }
@@ -148,43 +187,64 @@ export default function App() {
           newItems[index].token = dropboxToken;
           setItems(newItems);
           localStorage.setItem("sync-items", JSON.stringify(newItems));
-        } else {
-          setManualLocalPath(selected);
-        }
+        } else { setManualLocalPath(selected); }
       }
-    } catch (e) { alert("폴더 선택 오류: " + e); }
+    } catch (e) { await message("폴더 선택 오류: " + e, { kind: 'error' }); }
   };
 
-  const addManualItem = () => {
-    if (!newName || !manualLocalPath || !dropboxToken) return alert("정보를 입력하세요.");
+  const addManualItem = async () => {
+    if (!newName || !manualLocalPath || !dropboxToken) {
+      await message("정보를 입력하세요.", { kind: 'warning' });
+      return;
+    }
     const autoCloudPath = `/${newName.trim()}`;
-    if (items.some(i => i.cloud_path === autoCloudPath)) return alert("이미 존재합니다.");
+    if (items.some(i => i.cloud_path === autoCloudPath)) {
+      await message("이미 존재합니다.", { kind: 'warning' });
+      return;
+    }
     const newItems = [...items, { name: newName.trim(), local_path: manualLocalPath, cloud_path: autoCloudPath, token: dropboxToken, enabled: true }];
     setItems(newItems);
     localStorage.setItem("sync-items", JSON.stringify(newItems));
     setNewName(""); setManualLocalPath("");
   };
 
+  const handleRemoveItem = async (index: number) => {
+    const confirmed = await ask("목록에서 삭제할까요?", { title: '삭제 확인', kind: 'warning' });
+    if (confirmed) {
+      const newItems = items.filter((_, idx) => idx !== index);
+      setItems(newItems);
+      localStorage.setItem("sync-items", JSON.stringify(newItems));
+    }
+  };
+
   const handleCancel = async () => {
     try {
       await invoke("cancel_sync");
       setStatus("취소 요청 중...");
-    } catch (e) {
-      console.error("Cancel failed", e);
-    }
+    } catch (e) { console.error("Cancel failed", e); }
   };
 
   const syncAll = async () => {
+    if (loading) return;
     const validItems = items.filter(i => i.local_path !== "" && i.enabled);
-    if (validItems.length === 0) return alert("동기화할 항목이 없거나 활성화된 게임이 없습니다.");
+    if (validItems.length === 0) {
+      await message("동기화할 항목이 없거나 활성화된 게임이 없습니다.", { kind: 'warning' });
+      return;
+    }
     setLoading(true);
+    setIsUpdating(false);
     setProgress(0);
     setCurrentFile("파일 분석 중...");
     try {
       const res: any = await invoke("sync_folders", { items: validItems });
       setStatus(res.message);
     } catch (e) {
-      setStatus("실패: " + e);
+      const errStr = String(e);
+      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token")) {
+        await handleTokenExpiration();
+      } else {
+        setStatus("실패: " + e);
+      }
     } finally {
       setLoading(false);
     }
@@ -196,13 +256,13 @@ export default function App() {
         <div className="loading-overlay">
           <div className="loading-card">
             <div className="spinner"></div>
-            <h3>동기화 진행 중...</h3>
+            <h3>{isUpdating ? "업데이트 진행 중..." : "동기화 진행 중..."}</h3>
             <div className="progress-container">
               <div className="progress-bar" style={{ width: `${progress}%` }}></div>
             </div>
-            <p className="current-file">{currentFile}</p>
+            {!isUpdating && <p className="current-file">{currentFile}</p>}
             <p className="progress-text">{Math.round(progress)}% 완료</p>
-            <button onClick={handleCancel} className="cancel-btn">동기화 취소</button>
+            {!isUpdating && <button onClick={handleCancel} className="cancel-btn">동기화 취소</button>}
           </div>
         </div>
       )}
@@ -238,11 +298,7 @@ export default function App() {
             <div className="item-main">
               <div className="toggle-wrapper">
                 <label className="switch">
-                  <input 
-                    type="checkbox" 
-                    checked={item.enabled} 
-                    onChange={() => toggleItem(i)} 
-                  />
+                  <input type="checkbox" checked={item.enabled} onChange={() => toggleItem(i)} />
                   <span className="slider round"></span>
                 </label>
               </div>
@@ -254,19 +310,15 @@ export default function App() {
             </div>
             <div style={{display: "flex", gap: "5px"}}>
               <button onClick={() => pickLocalFolder(i)} className="secondary-btn">연결</button>
-              <button onClick={() => {
-                if(confirm("삭제할까요?")) {
-                  const n = items.filter((_, idx)=>idx!==i);
-                  setItems(n); localStorage.setItem("sync-items", JSON.stringify(n));
-                }
-              }} className="delete-btn">삭제</button>
+              <button onClick={() => handleRemoveItem(i)} className="delete-btn">삭제</button>
             </div>
           </div>
         ))}
       </div>
 
       <div className="action-section">
-        <button className="sync-btn" onClick={syncAll} disabled={items.filter(i=>i.local_path!=="" && i.enabled).length === 0 || loading}>동기화 시작</button>
+        <button className="sync-btn" onClick={syncAll} disabled={loading}>동기화 시작</button>
+        <button className="update-check-btn" onClick={() => checkForUpdates(true)} disabled={loading}>🔄 업데이트 확인</button>
         <div className="status-box"><pre>{status || "준비 완료"}</pre></div>
       </div>
     </div>

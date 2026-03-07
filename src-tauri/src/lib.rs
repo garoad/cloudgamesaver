@@ -147,13 +147,21 @@ async fn pick_folder_dialog<R: Runtime>(app: AppHandle<R>) -> Result<Option<Stri
 async fn exchange_code_for_token(code: String) -> Result<String, String> {
     let client = Client::new();
     let res = client.post("https://api.dropboxapi.com/oauth2/token")
-        .form(&[("code", code.as_str()), ("grant_type", "authorization_code"), ("client_id", get_app_key().as_str()), ("client_secret", get_app_secret().as_str()), ("redirect_uri", "http://localhost:8421/callback")])
+        .form(&[
+            ("code", code.as_str()), 
+            ("grant_type", "authorization_code"), 
+            ("client_id", get_app_key().as_str()), 
+            ("client_secret", get_app_secret().as_str()), 
+            ("redirect_uri", "http://localhost:8421/callback")
+        ])
         .send().await.map_err(|e| e.to_string())?;
+    
     if res.status().is_success() {
         let token_data: TokenResponse = res.json().await.map_err(|e| e.to_string())?;
         Ok(token_data.access_token)
     } else {
-        Err(res.text().await.unwrap_or_else(|_| "토큰 교환 실패".to_string()))
+        let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        Err(format!("토큰 교환 실패: {}", err_text))
     }
 }
 
@@ -163,22 +171,36 @@ async fn list_dropbox_folders(token: String) -> Result<Vec<String>, String> {
     let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({"path": ""})).send().await.map_err(|e| e.to_string())?;
+        .json(&serde_json::json!({"path": "", "recursive": false}))
+        .send().await.map_err(|e| e.to_string())?;
+    
     if res.status().is_success() {
         let list: DropboxListResponse = res.json().await.map_err(|e| e.to_string())?;
-        Ok(list.entries.into_iter().filter(|e| e.tag == "folder").map(|e| e.path_display.unwrap_or_else(|| format!("/{}", e.name))).collect())
-    } else { Err("목록 조회 실패".to_string()) }
+        Ok(list.entries.into_iter()
+            .filter(|e| e.tag == "folder")
+            .map(|e| e.path_display.unwrap_or_else(|| format!("/{}", e.name)))
+            .collect())
+    } else {
+        let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        Err(format!("목록 조회 실패: {}", err_text))
+    }
 }
 
 async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Vec<DropboxEntry> {
     let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({"path": path})).send().await;
+        .json(&serde_json::json!({"path": path}))
+        .send().await;
+    
     match res {
         Ok(r) => {
-            let list: DropboxListResponse = r.json().await.unwrap_or(DropboxListResponse { entries: Vec::new() });
-            list.entries.into_iter().filter(|e| e.tag == "file").collect()
+            if r.status().is_success() {
+                let list: DropboxListResponse = r.json().await.unwrap_or(DropboxListResponse { entries: Vec::new() });
+                list.entries.into_iter().filter(|e| e.tag == "file").collect()
+            } else {
+                Vec::new()
+            }
         }
         Err(_) => Vec::new(),
     }
@@ -206,13 +228,11 @@ async fn download_from_dropbox(client: &Client, token: &str, remote_path: String
 
 #[tauri::command]
 async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<SyncItem>) -> Result<SyncResult, String> {
-    // 취소 상태 초기화
     state.cancel_sync.store(false, Ordering::SeqCst);
     
     let client = Client::new();
     let mut total_tasks = Vec::new();
     
-    // 1. 분석 단계 (병렬)
     let mut fetch_tasks = FuturesUnordered::new();
     for item in items {
         let client_ref = client.clone();
@@ -224,14 +244,12 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
     
     let mut item_meta = Vec::new();
     while let Some(res) = fetch_tasks.next().await {
-        // 취소 체크
         if state.cancel_sync.load(Ordering::SeqCst) {
             return Ok(SyncResult { success: false, message: "사용자에 의해 취소되었습니다.".to_string() });
         }
         item_meta.push(res);
     }
 
-    // 2. 동기화 판단 단계 (해시 비교)
     for (item, remote_files) in item_meta {
         let local_dir = PathBuf::from(&item.local_path);
         if !local_dir.exists() { let _ = tokio::fs::create_dir_all(&local_dir).await; }
@@ -277,7 +295,6 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
         }
     }
 
-    // 3. 병렬 전송 실행 단계
     let total_count = total_tasks.len() as f32;
     let processed_count = Arc::new(Mutex::new(0));
     let mut worker_tasks = FuturesUnordered::new();
@@ -287,7 +304,6 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
     let client_arc = Arc::new(client);
 
     for (action, token, remote_path, local_path, file_name) in total_tasks {
-        // 전송 시작 전 취소 체크
         if state.cancel_sync.load(Ordering::SeqCst) {
             break;
         }
@@ -316,7 +332,6 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
         }
     }
 
-    // 남아있는 작업들 마무리 대기
     while let Some(_) = worker_tasks.next().await {}
 
     if state.cancel_sync.load(Ordering::SeqCst) {
@@ -329,7 +344,7 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(AppState::default()) // 상태 등록
+        .manage(AppState::default())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -345,7 +360,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             sync_folders, 
-            cancel_sync, // 취소 커맨드 추가
+            cancel_sync, 
             open_auth_url, 
             pick_folder_dialog, 
             exchange_code_for_token, 

@@ -60,6 +60,22 @@ button {
 .delete-btn { background: #fee2e2; color: #ef4444; padding: 0.4rem 0.8rem; font-size: 0.8rem; }
 .sync-btn:disabled { background: #d1d5db; cursor: not-allowed; }
 
+.update-check-btn {
+  width: 100%;
+  padding: 0.6rem;
+  background: transparent;
+  color: #6b7280;
+  border: 1px solid #d1d5db;
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+
+.update-check-btn:hover {
+  background: #f9fafb;
+  color: #3b82f6;
+  border-color: #3b82f6;
+}
+
 /* Sync List */
 .sync-item-card {
   background: white;
