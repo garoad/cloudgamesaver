@@ -1,6 +1,8 @@
 import { useState, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { check } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 import "./App.css";
 
 interface SyncItem {
@@ -23,6 +25,41 @@ export default function App() {
   const [manualLocalPath, setManualLocalPath] = useState("");
 
   useEffect(() => {
+    // 업데이트 확인
+    const checkForUpdates = async () => {
+      try {
+        const update = await check();
+        if (update) {
+          console.log(`Update found: ${update.version}`);
+          if (confirm(`새로운 버전(${update.version})이 있습니다. 업데이트하시겠습니까?\n\n내용: ${update.body}`)) {
+            let downloaded = 0;
+            let contentLength = 0;
+            await update.downloadAndInstall((event) => {
+              switch (event.event) {
+                case 'Started':
+                  contentLength = event.data.contentLength || 0;
+                  setStatus("업데이트 다운로드 중...");
+                  break;
+                case 'Progress':
+                  downloaded += event.data.chunkLength;
+                  if (contentLength > 0) {
+                    setProgress((downloaded / contentLength) * 100);
+                  }
+                  break;
+                case 'Finished':
+                  setStatus("업데이트 완료! 재시작합니다.");
+                  break;
+              }
+            });
+            await relaunch();
+          }
+        }
+      } catch (e) {
+        console.error("Update check failed", e);
+      }
+    };
+    checkForUpdates();
+
     const saved = localStorage.getItem("sync-items");
     const token = localStorage.getItem("dropbox-token");
     if (saved) {

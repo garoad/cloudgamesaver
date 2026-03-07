@@ -23,7 +23,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["nsis", "dmg", "app", "appimage"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -31,5 +31,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "RWQH2K+0mssbH5EnpxTu6FqqeMCuGkGCj2WxcG9iTG2N7Y4owsGgOL2",
+      "endpoints": [
+        "https://github.com/Garoad/cloudgamesaver/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
