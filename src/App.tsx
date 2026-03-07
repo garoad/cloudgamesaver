@@ -165,6 +165,15 @@ export default function App() {
     setNewName(""); setManualLocalPath("");
   };
 
+  const handleCancel = async () => {
+    try {
+      await invoke("cancel_sync");
+      setStatus("취소 요청 중...");
+    } catch (e) {
+      console.error("Cancel failed", e);
+    }
+  };
+
   const syncAll = async () => {
     const validItems = items.filter(i => i.local_path !== "" && i.enabled);
     if (validItems.length === 0) return alert("동기화할 항목이 없거나 활성화된 게임이 없습니다.");
@@ -185,13 +194,16 @@ export default function App() {
     <div className="container">
       {loading && (
         <div className="loading-overlay">
-          <div className="spinner"></div>
-          <h3>동기화 진행 중...</h3>
-          <div className="progress-container">
-            <div className="progress-bar" style={{ width: `${progress}%` }}></div>
+          <div className="loading-card">
+            <div className="spinner"></div>
+            <h3>동기화 진행 중...</h3>
+            <div className="progress-container">
+              <div className="progress-bar" style={{ width: `${progress}%` }}></div>
+            </div>
+            <p className="current-file">{currentFile}</p>
+            <p className="progress-text">{Math.round(progress)}% 완료</p>
+            <button onClick={handleCancel} className="cancel-btn">동기화 취소</button>
           </div>
-          <p className="current-file">{currentFile}</p>
-          <p className="progress-text">{Math.round(progress)}% 완료</p>
         </div>
       )}
 

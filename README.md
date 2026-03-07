@@ -1,12 +1,12 @@
 <div align="center">
   <img src="src-tauri/icons/128x128@2x.png" width="128" height="128" alt="CloudGameSaver Icon">
-  <h1>CloudGameSaver</h1>
-  <p><b>Dropbox 기반 멀티플랫폼 게임 세이브 동기화 솔루션</b></p>
+  <h1>CloudGameSaver v0.1.2</h1>
+  <p><b>Dropbox 기반 차세대 멀티플랫폼 게임 세이브 동기화 솔루션</b></p>
 
   <p>
-    <img src="https://img.shields.io/badge/Tauri-FFC131?style=for-the-badge&logo=tauri&logoColor=white" alt="Tauri">
+    <img src="https://img.shields.io/badge/Tauri-v2-FFC131?style=for-the-badge&logo=tauri&logoColor=white" alt="Tauri">
     <img src="https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white" alt="Rust">
-    <img src="https://img.shields.io/badge/React-61DAFB?style=for-the-badge&logo=react&logoColor=black" alt="React">
+    <img src="https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=black" alt="React">
     <img src="https://img.shields.io/badge/TypeScript-3178C6?style=for-the-badge&logo=typescript&logoColor=white" alt="TypeScript">
   </p>
 </div>
@@ -14,60 +14,46 @@
 ---
 
 > **Note**
-> CloudGameSaver는 여러 게임의 세이브 파일 위치를 지정하여 Dropbox 클라우드와 양방향 동기화를 수행합니다. 모든 파일은 수정 시간(Modified Time)을 기준으로 가장 최신 버전으로 업데이트됩니다.
+> CloudGameSaver는 여러 게임의 세이브 파일 위치를 지정하여 Dropbox 클라우드와 양방향 동기화를 수행합니다. 모든 파일은 수정 시간 및 해시(Hash)를 기준으로 가장 최신 버전으로 안전하게 업데이트됩니다.
 
-## 🚀 주요 기능
+## 🚀 v0.1.2 주요 개선 사항
 
-*   **자동 인증 (OAuth2):** 복잡한 코드 복사 없이 클릭 한 번으로 Dropbox 계정과 연동됩니다.
-*   **멀티스레드 병렬 처리:** `Rayon` 라이브러리를 활용하여 대량의 세이브 파일을 초고속으로 동기화합니다.
-*   **스마트 목록 관리:** Dropbox 서버의 폴더를 자동으로 탐색하고 로컬 경로와 매핑합니다.
-*   **실시간 진행 상황:** 동기화 중인 파일명과 전체 진행률을 프로그레스 바를 통해 확인할 수 있습니다.
-*   **경량 및 고성능:** Tauri와 Rust를 기반으로 제작되어 약 8MB 수준의 초경량 단일 실행 파일을 제공합니다.
+*   **⚡ 초고속 병렬 동기화:** `FuturesUnordered`를 도입하여 최대 5개의 파일을 동시에 업로드/다운로드합니다. 대량의 세이브 파일이 있는 게임에서 비약적인 속도 향상을 체감할 수 있습니다.
+*   **🔍 스마트 해시 비교:** Dropbox 전용 해시 알고리즘(4MB 블록 단위 SHA256)을 구현하여, 파일 내용이 실제로 변경된 경우에만 전송합니다. 불필요한 네트워크 트래픽을 최소화합니다.
+*   **🛑 안전한 동기화 취소:** 동기화 도중 언제든 안전하게 중단할 수 있는 기능을 추가했습니다. 현재 전송 중인 파일은 손상 없이 완료한 후 작업을 멈춥니다.
+*   **🌐 자동 온라인 업데이트:** 앱 실행 시 최신 버전을 자동으로 확인하고, GitHub Releases와 연동하여 원클릭으로 업데이트 및 재시작이 가능합니다.
+*   **🎨 현대적인 UI/UX:** 배경 흐림 효과(Blur)와 다크 모드 감성을 더한 로딩 카드, 상세한 진행 상황 표시 등 사용자 인터페이스를 대폭 개선했습니다.
 
-## 📂 폴더 구조
+## 📂 빌드 타겟 (Platform Support)
 
-```text
-cloudgamesaver/
-├── src/                # React (TypeScript) 프론트엔드 코드
-├── src-tauri/          # Rust 백엔드 코드
-│   ├── src/            # 동기화 로직 및 Dropbox API 연동
-│   ├── capabilities/   # Tauri 권한 설정
-│   ├── icons/          # 앱 아이콘 리소스
-│   └── tauri.conf.json # 앱 환경 설정
-├── .github/workflows/  # 자동 빌드 및 릴리즈 (CI/CD)
-├── build_windows.bat   # Windows용 빌드 스크립트
-└── build_unix.sh       # macOS/Linux용 빌드 스크립트
-```
-
-## 🛠 사용된 기술
-
-| 구분 | 사용 기술 | 비고 |
+| OS | 형식 | 특징 |
 |:---:|:---:|:---|
-| **Core** | Tauri v2 | 데스크톱 앱 런타임 |
-| **Backend** | Rust | 파일 시스템 및 네트워크 로직 |
-| **Frontend** | React, TypeScript | 사용자 인터페이스 |
-| **Library** | reqwest | Dropbox API 통신 |
-| **Parallel** | Rayon | 멀티스레딩 데이터 처리 |
-| **CI/CD** | GitHub Actions | 멀티플랫폼 자동 빌드 |
+| **Windows** | NSIS (.exe) | 단일 실행 파일 설치 프로그램 |
+| **macOS** | DMG / App | 유니버설 바이너리 지원 |
+| **Linux** | AppImage | 스팀덱(Steam Deck) 최적화 배포 형식 |
 
-## ⚙️ 실행 요구사항
+## 🛠 사용된 기술 및 라이브러리
 
-*   **Windows:** Windows 10 이상 (WebView2 설치 필요)
-*   **macOS:** High Sierra 이상
-*   **Linux:** GTK 및 WebKit2GTK 관련 패키지 설치 필요
-*   **Dropbox Account:** 세이브 데이터 저장을 위한 계정 필요
+| 구분 | 기술 / 라이브러리 | 용도 |
+|:---:|:---:|:---|
+| **Core** | Tauri v2 | 데스크톱 앱 프레임워크 |
+| **Async** | Tokio, Futures | 고성능 비동기 및 병렬 처리 |
+| **Network** | Reqwest | Dropbox API 통신 |
+| **Security** | Sha2, Hex | Dropbox Content Hash 계산 |
+| **Updater** | Tauri Plugin Updater | GitHub 연동 자동 업데이트 |
+| **Frontend** | React 19, Vite | 모던 프론트엔드 환경 |
 
-## 📦 빌드 방법
+## 📦 설치 및 빌드
 
-### Windows
+### 요구사항
+- [Rust](https://www.rust-lang.org/) 및 [Node.js](https://nodejs.org/) (LTS) 설치 필요
+
+### 빌드 명령어
 ```bash
-# build_windows.bat 실행 또는
-npm run tauri build
-```
+# 의존성 설치
+npm install
 
-### macOS / Linux
-```bash
-# build_unix.sh 실행 또는
+# 프로덕션 빌드 (Windows/Mac/Linux 자동 감지)
 npm run tauri build
 ```
 
