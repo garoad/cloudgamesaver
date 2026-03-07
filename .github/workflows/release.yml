@@ -58,3 +58,71 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  updater:
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: install tauri-cli
+        run: npm install -g @tauri-apps/cli
+
+      - name: Get Version
+        id: get_version
+        run: |
+          echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
+
+      - name: Generate latest.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 릴리즈 태그 이름 설정
+          TAG_NAME="v${{ steps.get_version.outputs.VERSION }}"
+          
+          # GitHub CLI로 릴리즈의 모든 자산(Assets) 목록 가져오기
+          gh release download $TAG_NAME --pattern "*" --dir assets || true
+          
+          # Tauri CLI를 사용하여 latest.json 생성 시도 (또는 커스텀 스크립트)
+          # 여기서는 수동으로 JSON 구조를 만듭니다 (Tauri 2.0 규격)
+          
+          # 날짜 설정
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          # JSON 기본 구조 생성
+          cat <<EOF > latest.json
+          {
+            "version": "$TAG_NAME",
+            "notes": "CloudGameSaver ${{ steps.get_version.outputs.VERSION }} 릴리즈",
+            "pub_date": "$PUB_DATE",
+            "platforms": {
+              "windows-x86_64": {
+                "signature": "$(cat assets/*.nsis.zip.sig 2>/dev/null || echo "")",
+                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$(ls assets | grep -E "nsis\.zip$" | head -n 1)"
+              },
+              "linux-x86_64": {
+                "signature": "$(cat assets/*.AppImage.tar.gz.sig 2>/dev/null || echo "")",
+                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$(ls assets | grep -E "AppImage\.tar\.gz$" | head -n 1)"
+              },
+              "darwin-aarch64": {
+                "signature": "$(cat assets/*_aarch64.app.tar.gz.sig 2>/dev/null || echo "")",
+                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$(ls assets | grep -E "aarch64\.app\.tar\.gz$" | head -n 1)"
+              },
+              "darwin-x86_64": {
+                "signature": "$(cat assets/*_x64.app.tar.gz.sig 2>/dev/null || echo "")",
+                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$(ls assets | grep -E "x64\.app\.tar\.gz$" | head -n 1)"
+              }
+            }
+          }
+          EOF
+          
+          # 생성된 latest.json을 릴리즈에 업로드
+          gh release upload $TAG_NAME latest.json --clobber
+
