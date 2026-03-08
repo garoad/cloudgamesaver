@@ -46,34 +46,46 @@ export default function App() {
     try {
       if (manual) setStatus("업데이트 확인 중...");
       const update = await check();
+      
       if (update) {
         if (manual) setStatus(""); 
         const shouldUpdate = await ask(
           `새로운 버전(${update.version})이 있습니다. 업데이트하시겠습니까?\n\n내용: ${update.body}`,
           { title: '업데이트 알림', kind: 'info' }
         );
+        
         if (shouldUpdate) {
           setLoading(true);
           setIsUpdating(true);
           setProgress(0);
+          
           let downloaded = 0;
           let contentLength = 0;
-          await update.downloadAndInstall((event) => {
-            switch (event.event) {
-              case 'Started':
-                contentLength = event.data.contentLength || 0;
-                setStatus("업데이트 다운로드 중...");
-                break;
-              case 'Progress':
-                downloaded += event.data.chunkLength;
-                if (contentLength > 0) setProgress((downloaded / contentLength) * 100);
-                break;
-              case 'Finished':
-                setStatus("업데이트 완료! 재시작합니다.");
-                break;
-            }
-          });
-          await relaunch();
+          
+          try {
+            await update.downloadAndInstall((event) => {
+              switch (event.event) {
+                case 'Started':
+                  contentLength = event.data.contentLength || 0;
+                  setStatus("업데이트 다운로드 중...");
+                  console.log(`Update started: ${contentLength} bytes`);
+                  break;
+                case 'Progress':
+                  downloaded += event.data.chunkLength;
+                  if (contentLength > 0) setProgress((downloaded / contentLength) * 100);
+                  break;
+                case 'Finished':
+                  setStatus("설치 완료! 재시작 중...");
+                  break;
+              }
+            });
+            
+            // 설치 완료 후 즉시 재시작
+            await relaunch();
+          } catch (installError) {
+            console.error("Installation failed:", installError);
+            await message(`업데이트 설치 중 오류가 발생했습니다: ${installError}`, { title: '설치 에러', kind: 'error' });
+          }
         }
       } else {
         if (manual) await message("현재 최신 버전을 사용 중입니다.", { title: '업데이트 확인', kind: 'info' });
@@ -81,8 +93,8 @@ export default function App() {
     } catch (e) {
       console.error("Update check error:", e);
       const errorStr = String(e);
-      if (manual && !errorStr.includes("404") && !errorStr.includes("Download request failed")) {
-        await message(`업데이트 확인 중 오류가 발생했습니다: ${e}`, { title: '에러', kind: 'error' });
+      if (manual) {
+        await message(`업데이트 확인 중 오류가 발생했습니다: ${errorStr}`, { title: '에러', kind: 'error' });
       }
     } finally {
       setLoading(false);

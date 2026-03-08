@@ -80,6 +80,15 @@ jobs:
         run: |
           echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
 
+      - name: Wait for Release Assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          TAG_NAME="v$VERSION"
+          echo "Waiting for assets to be ready in release $TAG_NAME..."
+          sleep 60 # 릴리즈 자산이 깃허브 서버에 완전히 전파될 때까지 대기
+
       - name: Generate latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -87,51 +96,56 @@ jobs:
           VERSION="${{ steps.get_version.outputs.VERSION }}"
           TAG_NAME="v$VERSION"
           
-          # 자산 다운로드 (서명 파일들 확인용)
           mkdir -p assets
-          gh release download $TAG_NAME --pattern "*.sig" --dir assets || true
-          gh release download $TAG_NAME --pattern "*.zip" --dir assets || true
-          gh release download $TAG_NAME --pattern "*.tar.gz" --dir assets || true
+          # 릴리즈에서 모든 자산 목록 가져오기 및 다운로드
+          gh release download $TAG_NAME --dir assets --clobber
           
-          # 각 플랫폼별 파일명 및 서명 추출
-          WIN_FILE=$(ls assets | grep -E "nsis\.zip$" | head -n 1)
-          LINUX_FILE=$(ls assets | grep -E "AppImage\.tar\.gz$" | head -n 1)
-          MAC_ARM_FILE=$(ls assets | grep -E "aarch64\.app\.tar\.gz$" | head -n 1)
-          MAC_X64_FILE=$(ls assets | grep -E "x64\.app\.tar\.gz$" | head -n 1)
+          echo "Downloaded assets list:"
+          ls assets
 
-          # 서명 내용 읽기
+          # 각 플랫폼별 실제 파일명 추출 (더 유연한 매칭)
+          WIN_FILE=$(ls assets | grep -i "\.nsis\.zip$" | head -n 1 || echo "")
+          LINUX_FILE=$(ls assets | grep -i "\.AppImage\.tar\.gz$" | head -n 1 || echo "")
+          MAC_ARM_FILE=$(ls assets | grep -i "aarch64\.app\.tar\.gz$" | head -n 1 || echo "")
+          MAC_X64_FILE=$(ls assets | grep -i "x64\.app\.tar\.gz$" | head -n 1 || echo "")
+
+          # 서명 파일(.sig) 매칭
           WIN_SIG=$(cat assets/$WIN_FILE.sig 2>/dev/null || echo "")
           LINUX_SIG=$(cat assets/$LINUX_FILE.sig 2>/dev/null || echo "")
           MAC_ARM_SIG=$(cat assets/$MAC_ARM_FILE.sig 2>/dev/null || echo "")
           MAC_X64_SIG=$(cat assets/$MAC_X64_FILE.sig 2>/dev/null || echo "")
 
-          # JSON 생성 (Tauri 2.0 규격 준수)
-          # 'version' 값은 'v' 없이 숫자만 들어가는 것이 일반적입니다.
-          cat <<EOF > latest.json
+          # URL 생성 (파일이 존재할 때만 생성)
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
+          
+          # JSON 빌드 (빈 파일 예외 처리 포함)
+          JSON_CONTENT=$(cat <<EOF
           {
             "version": "$VERSION",
             "notes": "CloudGameSaver $VERSION 업데이트가 준비되었습니다.",
             "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "platforms": {
-              "windows-x86_64": {
-                "signature": "$WIN_SIG",
-                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$WIN_FILE"
-              },
-              "linux-x86_64": {
-                "signature": "$LINUX_SIG",
-                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$LINUX_FILE"
-              },
-              "darwin-aarch64": {
-                "signature": "$MAC_ARM_SIG",
-                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$MAC_ARM_FILE"
-              },
-              "darwin-x86_64": {
-                "signature": "$MAC_X64_SIG",
-                "url": "https://github.com/${{ github.repository }}/releases/download/$TAG_NAME/$MAC_X64_FILE"
-              }
-            }
+            "platforms": {}
           }
           EOF
+          )
+
+          # 플랫폼 정보 동적 추가
+          if [ -n "$WIN_FILE" ]; then
+            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"windows-x86_64\"] = {\"signature\": \"$WIN_SIG\", \"url\": \"$BASE_URL/$WIN_FILE\"}")
+          fi
+          if [ -n "$LINUX_FILE" ]; then
+            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"linux-x86_64\"] = {\"signature\": \"$LINUX_SIG\", \"url\": \"$BASE_URL/$LINUX_FILE\"}")
+          fi
+          if [ -n "$MAC_ARM_FILE" ]; then
+            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"darwin-aarch64\"] = {\"signature\": \"$MAC_ARM_SIG\", \"url\": \"$BASE_URL/$MAC_ARM_FILE\"}")
+          fi
+          if [ -n "$MAC_X64_FILE" ]; then
+            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"darwin-x86_64\"] = {\"signature\": \"$MAC_X64_SIG\", \"url\": \"$BASE_URL/$MAC_X64_FILE\"}")
+          fi
+
+          echo \$JSON_CONTENT > latest.json
+          
+          echo "Generated latest.json content:"
+          cat latest.json
           
           gh release upload $TAG_NAME latest.json --clobber
-
