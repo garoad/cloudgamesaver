@@ -44,6 +44,15 @@ jobs:
       - name: install frontend dependencies
         run: npm install
 
+      - name: Verify Secrets
+        shell: bash
+        run: |
+          if [ -z "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is missing!"
+          else
+            echo "TAURI_SIGNING_PRIVATE_KEY is set."
+          fi
+
       - name: Build and Publish
         uses: tauri-apps/tauri-action@v0
         env:
@@ -60,11 +69,11 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-      - name: "[DEBUG] List Generated Files"
+      - name: "[DEBUG] List Artifacts"
         shell: bash
         run: |
-          echo "=== Listing all files in src-tauri/target ==="
-          find src-tauri/target -maxdepth 10 \( -name "*.zip" -o -name "*.sig" -o -name "*.tar.gz" -o -name "*.exe" \)
+          echo "=== Bundle files search ==="
+          find src-tauri/target -name "*.zip" -o -name "*.sig" -o -name "*.tar.gz" || echo "No bundle files found"
 
   updater:
     needs: publish-tauri
@@ -94,37 +103,24 @@ jobs:
           VERSION="${{ steps.get_version.outputs.VERSION }}"
           TAG_NAME="v$VERSION"
           
-          echo "Waiting for assets to settle..."
           sleep 60
-          
           mkdir -p assets
-          gh release download $TAG_NAME --dir assets --clobber || echo "No assets found yet"
+          gh release download $TAG_NAME --dir assets --clobber || true
           
-          echo "--- All Downloaded Assets ---"
-          ls -R assets
-          
-          # 파일 매칭 로직 (업데이터 전용 번들 우선)
-          WIN_FILE=$(ls assets | grep -iE "\.nsis\.zip$|\.msi\.zip$" | head -n 1 || echo "")
-          # 만약 위에서 못 찾았다면 일반 .zip 검색 (단, sig 파일이 있는 것만)
-          if [ -z "$WIN_FILE" ]; then
-            for f in $(ls assets | grep -i "\.zip$"); do
-              if [ -f "assets/$f.sig" ]; then WIN_FILE=$f; break; fi
-            done
-          fi
-          
-          LINUX_FILE=$(ls assets | grep -iE "\.AppImage\.tar\.gz$" | head -n 1 || echo "")
+          # 파일 검색 로직 (가장 유연하게)
+          WIN_FILE=$(ls assets | grep -iE "(\.nsis\.zip$|\.msi\.zip$|\.zip$)" | grep -iv "source" | head -n 1 || echo "")
+          LINUX_FILE=$(ls assets | grep -iE "(\.AppImage\.tar\.gz$|\.AppImage$)" | head -n 1 || echo "")
           MAC_FILE=$(ls assets | grep -iE "\.app\.tar\.gz$" | head -n 1 || echo "")
 
-          # 서명 읽기
+          # 서명은 .sig 확장자를 가진 파일을 찾음
           WIN_SIG=$(cat assets/$WIN_FILE.sig 2>/dev/null || echo "")
           LINUX_SIG=$(cat assets/$LINUX_FILE.sig 2>/dev/null || echo "")
           MAC_SIG=$(cat assets/$MAC_FILE.sig 2>/dev/null || echo "")
 
-          echo "DEBUG: WIN=$WIN_FILE, LINUX=$LINUX_FILE, MAC=$MAC_FILE"
+          echo "DEBUG: WIN=$WIN_FILE (SIG_LEN=${#WIN_SIG}), LINUX=$LINUX_FILE, MAC=$MAC_FILE"
 
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
           
-          # JSON 빌드
           echo "{
             \"version\": \"$VERSION\",
             \"notes\": \"CloudGameSaver $VERSION 업데이트가 준비되었습니다.\",
@@ -132,6 +128,7 @@ jobs:
             \"platforms\": {}
           }" > latest.json
 
+          # 서명이 있는 경우에만 플랫폼 추가 (서명 없는 업데이트는 작동하지 않음)
           if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
             jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
