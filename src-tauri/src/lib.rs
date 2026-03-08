@@ -42,6 +42,7 @@ pub struct SyncItem {
     local_path: String,
     cloud_path: String,
     token: String,
+    refresh_token: Option<String>,
     enabled: bool,
 }
 
@@ -75,29 +76,66 @@ struct DropboxListResponse {
 #[derive(Deserialize, Debug)]
 struct TokenResponse {
     access_token: String,
+    refresh_token: Option<String>,
+}
+
+async fn refresh_access_token(refresh_token: &str) -> Result<String, String> {
+    let client = Client::new();
+    let res = client.post("https://api.dropboxapi.com/oauth2/token")
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", get_app_key().as_str()),
+            ("client_secret", get_app_secret().as_str()),
+        ])
+        .send().await.map_err(|e| e.to_string())?;
+
+    if res.status().is_success() {
+        let token_data: TokenResponse = res.json().await.map_err(|e| e.to_string())?;
+        Ok(token_data.access_token)
+    } else {
+        let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        Err(format!("토큰 갱신 실패: {}", err_text))
+    }
 }
 
 async fn compute_dropbox_hash(path: &PathBuf) -> String {
-    let file_data = match tokio::fs::read(path).await {
-        Ok(d) => d,
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
         Err(_) => return String::new(),
     };
-    
+
     let mut overall_hasher = Sha256::new();
-    let mut blocks = 0;
-    
-    for chunk in file_data.chunks(4 * 1024 * 1024) {
+    let mut has_any_block = false;
+
+    loop {
+        let mut buffer = vec![0u8; 4 * 1024 * 1024];
+        let mut total_read = 0;
+        
+        while total_read < buffer.len() {
+            use tokio::io::AsyncReadExt;
+            match file.read(&mut buffer[total_read..]).await {
+                Ok(0) => break,
+                Ok(n) => total_read += n,
+                Err(_) => break,
+            }
+        }
+
+        if total_read == 0 { break; }
+
         let mut block_hasher = Sha256::new();
-        block_hasher.update(chunk);
+        block_hasher.update(&buffer[..total_read]);
         overall_hasher.update(block_hasher.finalize());
-        blocks += 1;
+        has_any_block = true;
+
+        if total_read < buffer.len() { break; }
     }
-    
-    if blocks == 0 {
-        let block_hasher = Sha256::new();
-        overall_hasher.update(block_hasher.finalize());
+
+    if !has_any_block {
+        let empty_block_hasher = Sha256::new();
+        return hex::encode(empty_block_hasher.finalize());
     }
-    
+
     hex::encode(overall_hasher.finalize())
 }
 
@@ -110,7 +148,7 @@ fn cancel_sync(state: State<'_, AppState>) {
 fn open_auth_url(app: AppHandle) -> Result<(), String> {
     let redirect_uri = "http://localhost:8421/callback";
     let auth_url = format!(
-        "https://www.dropbox.com/oauth2/authorize?client_id={}&response_type=code&redirect_uri={}",
+        "https://www.dropbox.com/oauth2/authorize?client_id={}&response_type=code&redirect_uri={}&token_access_type=offline",
         get_app_key(), redirect_uri
     );
     let app_handle = app.clone();
@@ -144,7 +182,7 @@ async fn pick_folder_dialog<R: Runtime>(app: AppHandle<R>) -> Result<Option<Stri
 }
 
 #[tauri::command]
-async fn exchange_code_for_token(code: String) -> Result<String, String> {
+async fn exchange_code_for_token(code: String) -> Result<serde_json::Value, String> {
     let client = Client::new();
     let res = client.post("https://api.dropboxapi.com/oauth2/token")
         .form(&[
@@ -158,7 +196,10 @@ async fn exchange_code_for_token(code: String) -> Result<String, String> {
     
     if res.status().is_success() {
         let token_data: TokenResponse = res.json().await.map_err(|e| e.to_string())?;
-        Ok(token_data.access_token)
+        Ok(serde_json::json!({
+            "access_token": token_data.access_token,
+            "refresh_token": token_data.refresh_token
+        }))
     } else {
         let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
         Err(format!("토큰 교환 실패: {}", err_text))
@@ -186,23 +227,20 @@ async fn list_dropbox_folders(token: String) -> Result<Vec<String>, String> {
     }
 }
 
-async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Vec<DropboxEntry> {
+async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Result<Vec<DropboxEntry>, String> {
     let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
         .json(&serde_json::json!({"path": path}))
-        .send().await;
+        .send().await.map_err(|e| e.to_string())?;
     
-    match res {
-        Ok(r) => {
-            if r.status().is_success() {
-                let list: DropboxListResponse = r.json().await.unwrap_or(DropboxListResponse { entries: Vec::new() });
-                list.entries.into_iter().filter(|e| e.tag == "file").collect()
-            } else {
-                Vec::new()
-            }
-        }
-        Err(_) => Vec::new(),
+    if res.status().is_success() {
+        let list: DropboxListResponse = res.json().await.map_err(|e| e.to_string())?;
+        Ok(list.entries.into_iter().filter(|e| e.tag == "file").collect())
+    } else {
+        let err_code = res.status().as_u16();
+        let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        Err(format!("ERR_CODE:{} | 클라우드 파일 목록 조회 실패 ({}): {}", err_code, path, err_text))
     }
 }
 
@@ -227,31 +265,41 @@ async fn download_from_dropbox(client: &Client, token: &str, remote_path: String
 }
 
 #[tauri::command]
-async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<SyncItem>) -> Result<SyncResult, String> {
+async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec<SyncItem>) -> Result<SyncResult, String> {
     state.cancel_sync.store(false, Ordering::SeqCst);
     
     let client = Client::new();
     let mut total_tasks = Vec::new();
+    let mut updated_tokens = Vec::new();
     
-    let mut fetch_tasks = FuturesUnordered::new();
-    for item in items {
-        let client_ref = client.clone();
-        fetch_tasks.push(async move {
-            let remote_files = list_dropbox_files(&client_ref, &item.token, &item.cloud_path).await;
-            (item, remote_files)
-        });
-    }
-    
-    let mut item_meta = Vec::new();
-    while let Some(res) = fetch_tasks.next().await {
-        if state.cancel_sync.load(Ordering::SeqCst) {
-            return Ok(SyncResult { success: false, message: "사용자에 의해 취소되었습니다.".to_string() });
-        }
-        item_meta.push(res);
-    }
-
-    for (item, remote_files) in item_meta {
-        let local_dir = PathBuf::from(&item.local_path);
+    for i in 0..items.len() {
+        if !items[i].enabled { continue; }
+        
+        let mut current_token = items[i].token.clone();
+        let res = list_dropbox_files(&client, &current_token, &items[i].cloud_path).await;
+        
+        let remote_files = match res {
+            Ok(files) => files,
+            Err(e) if e.contains("401") || e.contains("expired") => {
+                if let Some(ref refresh) = items[i].refresh_token {
+                    println!("[Sync] 토큰 만료 감지, 갱신 시도: {}", items[i].name);
+                    match refresh_access_token(refresh).await {
+                        Ok(new_token) => {
+                            current_token = new_token.clone();
+                            items[i].token = new_token.clone();
+                            updated_tokens.push((i, new_token));
+                            list_dropbox_files(&client, &current_token, &items[i].cloud_path).await?
+                        },
+                        Err(re) => return Err(format!("토큰 갱신 실패: {}. 다시 로그인해주세요.", re))
+                    }
+                } else {
+                    return Err("세션이 만료되었습니다. 다시 로그인해주세요.".to_string());
+                }
+            },
+            Err(e) => return Err(e)
+        };
+        
+        let local_dir = PathBuf::from(&items[i].local_path);
         if !local_dir.exists() { let _ = tokio::fs::create_dir_all(&local_dir).await; }
         
         let mut remote_file_names = HashSet::new();
@@ -259,25 +307,33 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
             let file_name = remote_file.name.clone();
             remote_file_names.insert(file_name.clone());
             let local_path = local_dir.join(&file_name);
-            let remote_path = format!("{}/{}", item.cloud_path.trim_end_matches('/'), file_name);
+            let remote_path = format!("{}/{}", items[i].cloud_path.trim_end_matches('/'), file_name);
             let remote_hash = remote_file.content_hash.clone().unwrap_or_default();
             
             if !local_path.exists() {
-                total_tasks.push(("down", item.token.clone(), remote_path, local_path, file_name));
+                println!("[Sync] 신규 다운로드 감지: {}", file_name);
+                total_tasks.push(("down", current_token.clone(), remote_path, local_path, file_name));
             } else {
                 let local_hash = compute_dropbox_hash(&local_path).await;
                 if local_hash != remote_hash {
-                    let remote_modified = DateTime::parse_from_rfc3339(remote_file.server_modified.as_ref().unwrap()).unwrap().with_timezone(&Utc);
+                    let remote_modified_str = remote_file.server_modified.as_deref().unwrap_or("");
+                    let remote_modified = DateTime::parse_from_rfc3339(remote_modified_str)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|e| format!("서버 시간 파싱 실패: {}", e))?;
+                        
                     if let Ok(metadata) = tokio::fs::metadata(&local_path).await {
                         if let Ok(modified) = metadata.modified() {
                             let local_modified: DateTime<Utc> = modified.into();
-                            if remote_modified > local_modified + chrono::Duration::seconds(1) {
-                                total_tasks.push(("down", item.token.clone(), remote_path, local_path, file_name));
-                            } else if local_modified > remote_modified + chrono::Duration::seconds(1) {
-                                total_tasks.push(("up", item.token.clone(), remote_path, local_path, file_name));
+                            println!("[Sync] 해시 불일치 ({}): 로컬={}, 서버={}", file_name, local_modified, remote_modified);
+                            if remote_modified > local_modified {
+                                total_tasks.push(("down", current_token.clone(), remote_path, local_path, file_name));
+                            } else {
+                                total_tasks.push(("up", current_token.clone(), remote_path, local_path, file_name));
                             }
                         }
                     }
+                } else {
+                    println!("[Sync] 파일 일치 (해시 동일): {}", file_name);
                 }
             }
         }
@@ -288,14 +344,22 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
                 if path.is_dir() { continue; }
                 let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
                 if !remote_file_names.contains(&file_name) {
-                    let remote_path = format!("{}/{}", item.cloud_path.trim_end_matches('/'), file_name);
-                    total_tasks.push(("up", item.token.clone(), remote_path, path, file_name));
+                    let remote_path = format!("{}/{}", items[i].cloud_path.trim_end_matches('/'), file_name);
+                    total_tasks.push(("up", current_token.clone(), remote_path, path, file_name));
                 }
             }
         }
     }
 
+    if !updated_tokens.is_empty() {
+        let _ = app.emit("tokens-updated", updated_tokens);
+    }
+
     let total_count = total_tasks.len() as f32;
+    if total_count == 0.0 {
+        return Ok(SyncResult { success: true, message: "이미 모든 파일이 최신 상태입니다.".to_string() });
+    }
+
     let processed_count = Arc::new(Mutex::new(0));
     let mut worker_tasks = FuturesUnordered::new();
     let concurrency_limit = 5;
@@ -335,9 +399,9 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, items: Vec<Syn
     while let Some(_) = worker_tasks.next().await {}
 
     if state.cancel_sync.load(Ordering::SeqCst) {
-        Ok(SyncResult { success: false, message: "동기화가 중단되었습니다. 일부 파일은 전송되지 않았을 수 있습니다.".to_string() })
+        Ok(SyncResult { success: false, message: "동기화가 중단되었습니다.".to_string() })
     } else {
-        Ok(SyncResult { success: true, message: "동기화 완료 (최적화 모드)".to_string() })
+        Ok(SyncResult { success: true, message: format!("동기화 완료 ({}개의 파일 처리)", total_count) })
     }
 }
 

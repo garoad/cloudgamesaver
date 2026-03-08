@@ -11,12 +11,14 @@ interface SyncItem {
   local_path: string;
   cloud_path: string;
   token: string;
+  refresh_token: string | null;
   enabled: boolean;
 }
 
 export default function App() {
   const [items, setItems] = useState<SyncItem[]>([]);
   const [dropboxToken, setDropboxToken] = useState("");
+  const [refreshToken, setRefreshToken] = useState<string | null>(null);
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
@@ -31,7 +33,9 @@ export default function App() {
   // 토큰 만료 처리 함수
   const handleTokenExpiration = async () => {
     setDropboxToken("");
+    setRefreshToken(null);
     localStorage.removeItem("dropbox-token");
+    localStorage.removeItem("dropbox-refresh-token");
     setStatus("세션이 만료되었습니다. 드롭박스를 다시 연결해주세요.");
     await message("드롭박스 인증 세션이 만료되었습니다. 보안을 위해 다시 연결이 필요합니다.", { title: '알림', kind: 'warning' });
   };
@@ -95,29 +99,54 @@ export default function App() {
 
     const saved = localStorage.getItem("sync-items");
     const token = localStorage.getItem("dropbox-token");
+    const rToken = localStorage.getItem("dropbox-refresh-token");
+    
     if (saved) {
       try { 
         const parsed = JSON.parse(saved);
         const migrated = parsed.map((item: any) => ({
           ...item,
-          enabled: item.enabled !== undefined ? item.enabled : true
+          enabled: item.enabled !== undefined ? item.enabled : true,
+          refresh_token: item.refresh_token || rToken || null
         }));
         setItems(migrated); 
       } catch (e) { console.error("Failed to load saved items", e); }
     }
     if (token) setDropboxToken(token);
+    if (rToken) setRefreshToken(rToken);
 
     const unConnect = listen("dropbox-code-received", async (event: any) => {
       setLoading(true);
       setStatus("토큰 발급 중...");
       try {
-        const token: string = await invoke("exchange_code_for_token", { code: event.payload as string });
-        setDropboxToken(token);
-        localStorage.setItem("dropbox-token", token);
+        const res: any = await invoke("exchange_code_for_token", { code: event.payload as string });
+        const { access_token, refresh_token } = res;
+        
+        setDropboxToken(access_token);
+        setRefreshToken(refresh_token);
+        localStorage.setItem("dropbox-token", access_token);
+        if (refresh_token) localStorage.setItem("dropbox-refresh-token", refresh_token);
+        
         setStatus("연결 성공!");
-        await fetchCloudFolders(token);
+        await fetchCloudFolders(access_token);
       } catch (e) { setStatus("연결 실패: " + e); }
       finally { setLoading(false); }
+    });
+
+    const unTokenUpdated = listen("tokens-updated", (event: any) => {
+      const updatedPairs = event.payload as [number, string][];
+      setItems(prev => {
+        const next = [...prev];
+        updatedPairs.forEach(([index, newToken]) => {
+          if (next[index]) {
+            next[index].token = newToken;
+            setDropboxToken(newToken);
+            localStorage.setItem("dropbox-token", newToken);
+          }
+        });
+        localStorage.setItem("sync-items", JSON.stringify(next));
+        return next;
+      });
     });
 
     const unProgress = listen("sync-progress", (event: any) => {
@@ -128,6 +157,7 @@ export default function App() {
 
     return () => {
       unConnect.then(f => f());
+      unTokenUpdated.then(f => f());
       unProgress.then(f => f());
     };
   }, []);
@@ -137,6 +167,7 @@ export default function App() {
     setStatus("클라우드 목록 가져오는 중...");
     try {
       const folders: string[] = await invoke("list_dropbox_folders", { token });
+      const rToken = localStorage.getItem("dropbox-refresh-token");
       
       setItems(prevItems => {
         const existingCloudPaths = new Set(prevItems.map(i => i.cloud_path));
@@ -144,7 +175,7 @@ export default function App() {
           .filter(path => !existingCloudPaths.has(path))
           .map(path => {
             const name = path.split('/').pop() || path;
-            return { name, local_path: "", cloud_path: path, token, enabled: true };
+            return { name, local_path: "", cloud_path: path, token, refresh_token: rToken, enabled: true };
           });
         const updatedItems = [...prevItems, ...newCloudItems];
         localStorage.setItem("sync-items", JSON.stringify(updatedItems));
@@ -154,7 +185,7 @@ export default function App() {
       });
     } catch (e) {
       const errStr = String(e);
-      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token")) {
+      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token") || errStr.includes("401")) {
         await handleTokenExpiration();
       } else {
         setStatus("목록 가져오기 실패: " + e);
@@ -185,6 +216,7 @@ export default function App() {
           const newItems = [...items];
           newItems[index].local_path = selected;
           newItems[index].token = dropboxToken;
+          newItems[index].refresh_token = refreshToken;
           setItems(newItems);
           localStorage.setItem("sync-items", JSON.stringify(newItems));
         } else { setManualLocalPath(selected); }
@@ -202,7 +234,7 @@ export default function App() {
       await message("이미 존재합니다.", { kind: 'warning' });
       return;
     }
-    const newItems = [...items, { name: newName.trim(), local_path: manualLocalPath, cloud_path: autoCloudPath, token: dropboxToken, enabled: true }];
+    const newItems = [...items, { name: newName.trim(), local_path: manualLocalPath, cloud_path: autoCloudPath, token: dropboxToken, refresh_token: refreshToken, enabled: true }];
     setItems(newItems);
     localStorage.setItem("sync-items", JSON.stringify(newItems));
     setNewName(""); setManualLocalPath("");
@@ -226,7 +258,14 @@ export default function App() {
 
   const syncAll = async () => {
     if (loading) return;
-    const validItems = items.filter(i => i.local_path !== "" && i.enabled);
+    
+    const rToken = localStorage.getItem("dropbox-refresh-token");
+    const validItems = items.filter(i => i.local_path !== "" && i.enabled).map(i => ({
+      ...i,
+      token: i.token || dropboxToken,
+      refresh_token: i.refresh_token || rToken
+    }));
+
     if (validItems.length === 0) {
       await message("동기화할 항목이 없거나 활성화된 게임이 없습니다.", { kind: 'warning' });
       return;
@@ -240,7 +279,7 @@ export default function App() {
       setStatus(res.message);
     } catch (e) {
       const errStr = String(e);
-      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token")) {
+      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token") || errStr.includes("401")) {
         await handleTokenExpiration();
       } else {
         setStatus("실패: " + e);
