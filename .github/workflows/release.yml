@@ -46,11 +46,14 @@ jobs:
 
       - name: Verify Secret Presence
         shell: bash
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
         run: |
-          if [ -n "${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}" ]; then
-            echo "SIGNING_KEY is present (Length: ${#${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}})"
+          if [ -n "$SIGNING_KEY" ]; then
+            echo "SIGNING_KEY is present in environment."
           else
             echo "::error::SIGNING_KEY IS MISSING IN SECRETS!"
+            exit 1
           fi
 
       - name: Build and Publish
