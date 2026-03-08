@@ -60,7 +60,7 @@ jobs:
           prerelease: false
           args: ${{ matrix.args }}
 
-      - name: [DEBUG] List Generated Files
+      - name: "[DEBUG] List Generated Files"
         shell: bash
         run: |
           echo "=== Listing all files in src-tauri/target/release/bundle ==="
