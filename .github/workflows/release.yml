@@ -88,29 +88,41 @@ jobs:
           VERSION="${{ steps.get_version.outputs.VERSION }}"
           TAG_NAME="v$VERSION"
           
-          # 모든 플랫폼 자산이 올라올 때까지 충분히 대기
-          echo "Waiting for all assets to be ready (180s)..."
-          sleep 180
-          
           mkdir -p assets
           gh release download $TAG_NAME --dir assets --clobber || true
           
-          echo "=== Asset Inventory ==="
-          ls -R assets
+          echo "=== Downloaded Assets List ==="
+          ls -F assets
           
-          # 정밀 파일 매칭
-          WIN_FILE=$(ls assets | grep -iE "\.nsis\.zip$" | head -n 1 || ls assets | grep -iE "\.msi\.zip$" | head -n 1 || ls assets | grep -iE "\.zip$" | grep -iv "source" | head -n 1 || echo "")
-          LINUX_FILE=$(ls assets | grep -iE "AppImage.*\.tar\.gz$" | head -n 1 || echo "")
-          MAC_FILE=$(ls assets | grep -iE "universal.*\.app\.tar\.gz$" | head -n 1 || ls assets | grep -iE "\.app\.tar\.gz$" | head -n 1 || echo "")
+          # 1. 윈도우 파일 찾기 (.exe + .exe.sig 쌍 확인)
+          for f in $(ls assets | grep -iE "\.exe$"); do
+            if [ -f "assets/$f.sig" ]; then
+              WIN_FILE=$f
+              WIN_SIG=$(cat "assets/$f.sig")
+              echo "Found Windows Asset: $f"
+              break
+            fi
+          done
 
-          # 서명 추출
-          WIN_SIG=$(cat assets/$WIN_FILE.sig 2>/dev/null || echo "")
-          LINUX_SIG=$(cat assets/$LINUX_FILE.sig 2>/dev/null || echo "")
-          MAC_SIG=$(cat assets/$MAC_FILE.sig 2>/dev/null || echo "")
+          # 2. 리눅스 파일 찾기 (.AppImage + .AppImage.sig 쌍 확인)
+          for f in $(ls assets | grep -iE "\.AppImage$"); do
+            if [ -f "assets/$f.sig" ]; then
+              LINUX_FILE=$f
+              LINUX_SIG=$(cat "assets/$f.sig")
+              echo "Found Linux Asset: $f"
+              break
+            fi
+          done
 
-          echo "DEBUG: WIN=$WIN_FILE (SIG_LEN=${#WIN_SIG})"
-          echo "DEBUG: LIN=$LINUX_FILE (SIG_LEN=${#LINUX_SIG})"
-          echo "DEBUG: MAC=$MAC_FILE (SIG_LEN=${#MAC_SIG})"
+          # 3. 맥 파일 찾기 (.app.tar.gz + .sig 쌍 확인)
+          for f in $(ls assets | grep -iE "\.app\.tar\.gz$"); do
+            if [ -f "assets/$f.sig" ]; then
+              MAC_FILE=$f
+              MAC_SIG=$(cat "assets/$f.sig")
+              echo "Found macOS Asset: $f"
+              break
+            fi
+          done
 
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
           
@@ -121,7 +133,7 @@ jobs:
             \"platforms\": {}
           }" > latest.json
 
-          # 서명이 있는 경우에만 추가 (안전 장치)
+          # 각 플랫폼 정보 주입
           if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
             jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
@@ -132,5 +144,7 @@ jobs:
             jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
 
+          echo "=== Generated latest.json ==="
           cat latest.json
+          
           gh release upload $TAG_NAME latest.json --clobber
