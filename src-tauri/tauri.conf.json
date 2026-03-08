@@ -34,7 +34,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "RWQH2K+0mssbH5EnpxTu6FqqeMCuGkGCj2WxcG9iTG2N7Y4owsGgOL2",
+      "pubkey": "RWRDAZK3VxO0Y0XhsC1pEO6u5TDX7zMllDx5iCjk+OIItPKNNhoza6F8",
       "endpoints": [
         "https://github.com/garoad/cloudgamesaver/releases/latest/download/latest.json"
       ]
