@@ -88,28 +88,29 @@ jobs:
           VERSION="${{ steps.get_version.outputs.VERSION }}"
           TAG_NAME="v$VERSION"
           
-          echo "Waiting for assets to propagate (90s)..."
-          sleep 90
+          # 모든 플랫폼 자산이 올라올 때까지 충분히 대기
+          echo "Waiting for all assets to be ready (180s)..."
+          sleep 180
           
           mkdir -p assets
           gh release download $TAG_NAME --dir assets --clobber || true
           
-          echo "=== Downloaded Assets List ==="
+          echo "=== Asset Inventory ==="
           ls -R assets
           
-          # 파일 찾기 (Tauri v2 업데이터 표준 패턴)
-          WIN_FILE=$(ls assets | grep -iE "\.zip$" | grep -iv "source" | head -n 1 || echo "")
+          # 정밀 파일 매칭
+          WIN_FILE=$(ls assets | grep -iE "\.nsis\.zip$" | head -n 1 || ls assets | grep -iE "\.msi\.zip$" | head -n 1 || ls assets | grep -iE "\.zip$" | grep -iv "source" | head -n 1 || echo "")
           LINUX_FILE=$(ls assets | grep -iE "AppImage.*\.tar\.gz$" | head -n 1 || echo "")
           MAC_FILE=$(ls assets | grep -iE "universal.*\.app\.tar\.gz$" | head -n 1 || ls assets | grep -iE "\.app\.tar\.gz$" | head -n 1 || echo "")
 
-          # 서명 파일 직접 검색 (.sig)
+          # 서명 추출
           WIN_SIG=$(cat assets/$WIN_FILE.sig 2>/dev/null || echo "")
           LINUX_SIG=$(cat assets/$LINUX_FILE.sig 2>/dev/null || echo "")
           MAC_SIG=$(cat assets/$MAC_FILE.sig 2>/dev/null || echo "")
 
-          echo "DEBUG: WIN_FILE=$WIN_FILE (SIG_LEN=${#WIN_SIG})"
-          echo "DEBUG: LINUX_FILE=$LINUX_FILE (SIG_LEN=${#LINUX_SIG})"
-          echo "DEBUG: MAC_FILE=$MAC_FILE (SIG_LEN=${#MAC_SIG})"
+          echo "DEBUG: WIN=$WIN_FILE (SIG_LEN=${#WIN_SIG})"
+          echo "DEBUG: LIN=$LINUX_FILE (SIG_LEN=${#LINUX_SIG})"
+          echo "DEBUG: MAC=$MAC_FILE (SIG_LEN=${#MAC_SIG})"
 
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
           
@@ -120,7 +121,7 @@ jobs:
             \"platforms\": {}
           }" > latest.json
 
-          # 서명이 있는 경우에만 추가 (없으면 업데이트 작동 안 함)
+          # 서명이 있는 경우에만 추가 (안전 장치)
           if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
             jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
