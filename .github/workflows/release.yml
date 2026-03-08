@@ -17,9 +17,9 @@ jobs:
           - platform: "macos-latest"
             args: "--target universal-apple-darwin"
           - platform: "ubuntu-22.04"
-            args: "" # 모든 번들(AppImage 및 Updater 자산) 빌드
+            args: ""
           - platform: "windows-latest"
-            args: "" # 모든 번들(NSIS 및 Updater 자산) 빌드
+            args: ""
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -44,7 +44,8 @@ jobs:
       - name: install frontend dependencies
         run: npm install
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build and Publish
+        uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -58,6 +59,12 @@ jobs:
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+      - name: [DEBUG] List Generated Files
+        shell: bash
+        run: |
+          echo "=== Listing all files in src-tauri/target/release/bundle ==="
+          find src-tauri/target -name "bundle" -type d -exec find {} -maxdepth 3 \; || echo "No bundle directory found"
 
   updater:
     needs: publish-tauri
@@ -80,15 +87,6 @@ jobs:
         run: |
           echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
 
-      - name: Wait for Release Assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ steps.get_version.outputs.VERSION }}"
-          TAG_NAME="v$VERSION"
-          echo "Waiting for assets to be ready in release $TAG_NAME..."
-          sleep 30
-
       - name: Generate latest.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -96,21 +94,33 @@ jobs:
           VERSION="${{ steps.get_version.outputs.VERSION }}"
           TAG_NAME="v$VERSION"
           
-          mkdir -p assets
-          gh release download $TAG_NAME --dir assets --clobber
+          echo "Waiting for assets to settle..."
+          sleep 30
           
-          echo "Downloaded assets list:"
-          ls assets
+          mkdir -p assets
+          gh release download $TAG_NAME --dir assets --clobber || echo "No assets found yet"
+          
+          echo "--- All Downloaded Assets ---"
+          ls -R assets
+          echo "----------------------------"
 
-          # 업데이트용 압축 파일 검색 (Tauri 표준 패턴)
-          WIN_FILE=$(ls assets | grep -i "\.nsis\.zip$" | head -n 1 || ls assets | grep -i "\.msi\.zip$" | head -n 1 || echo "")
-          LINUX_FILE=$(ls assets | grep -i "\.AppImage\.tar\.gz$" | head -n 1 || echo "")
-          MAC_FILE=$(ls assets | grep -i "\.app\.tar\.gz$" | head -n 1 || echo "")
+          # 유연한 패턴 매칭
+          WIN_FILE=$(ls assets | grep -iE "\.nsis\.zip$|\.msi\.zip$|\.zip$" | grep -iv "source" | head -n 1 || echo "")
+          LINUX_FILE=$(ls assets | grep -iE "\.AppImage\.tar\.gz$|\.AppImage$" | head -n 1 || echo "")
+          MAC_FILE=$(ls assets | grep -iE "\.app\.tar\.gz$" | head -n 1 || echo "")
 
-          # 서명 파일(.sig) 매칭
+          echo "DEBUG: Detected WIN_FILE=$WIN_FILE"
+          echo "DEBUG: Detected LINUX_FILE=$LINUX_FILE"
+          echo "DEBUG: Detected MAC_FILE=$MAC_FILE"
+
+          # 서명 파일 검색 및 내용 읽기
           WIN_SIG=$(cat assets/$WIN_FILE.sig 2>/dev/null || echo "")
           LINUX_SIG=$(cat assets/$LINUX_FILE.sig 2>/dev/null || echo "")
           MAC_SIG=$(cat assets/$MAC_FILE.sig 2>/dev/null || echo "")
+
+          echo "DEBUG: WIN_SIG_LENGTH=${#WIN_SIG}"
+          echo "DEBUG: LINUX_SIG_LENGTH=${#LINUX_SIG}"
+          echo "DEBUG: MAC_SIG_LENGTH=${#MAC_SIG}"
 
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
           
@@ -122,7 +132,7 @@ jobs:
             \"platforms\": {}
           }" > latest.json
 
-          # 각 플랫폼 정보 주입
+          # 각 플랫폼 추가 (파일이 있을 때만)
           if [ -n "$WIN_FILE" ]; then
             jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
@@ -130,11 +140,11 @@ jobs:
             jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
           if [ -n "$MAC_FILE" ]; then
-            # Mac은 Universal 파일을 두 아키텍처에 공통 적용
             jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
 
-          echo "Generated latest.json content:"
+          echo "--- Final latest.json ---"
           cat latest.json
+          echo "------------------------"
           
           gh release upload $TAG_NAME latest.json --clobber
