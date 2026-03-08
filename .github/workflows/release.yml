@@ -17,9 +17,9 @@ jobs:
           - platform: "macos-latest"
             args: "--target universal-apple-darwin"
           - platform: "ubuntu-22.04"
-            args: "--bundles appimage"
+            args: "" # 모든 번들(AppImage 및 Updater 자산) 빌드
           - platform: "windows-latest"
-            args: "--bundles nsis"
+            args: "" # 모든 번들(NSIS 및 Updater 자산) 빌드
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -87,7 +87,7 @@ jobs:
           VERSION="${{ steps.get_version.outputs.VERSION }}"
           TAG_NAME="v$VERSION"
           echo "Waiting for assets to be ready in release $TAG_NAME..."
-          sleep 60 # 릴리즈 자산이 깃허브 서버에 완전히 전파될 때까지 대기
+          sleep 30
 
       - name: Generate latest.json
         env:
@@ -97,54 +97,43 @@ jobs:
           TAG_NAME="v$VERSION"
           
           mkdir -p assets
-          # 릴리즈에서 모든 자산 목록 가져오기 및 다운로드
           gh release download $TAG_NAME --dir assets --clobber
           
           echo "Downloaded assets list:"
           ls assets
 
-          # 각 플랫폼별 실제 파일명 추출 (더 유연한 매칭)
-          WIN_FILE=$(ls assets | grep -i "\.nsis\.zip$" | head -n 1 || echo "")
+          # 업데이트용 압축 파일 검색 (Tauri 표준 패턴)
+          WIN_FILE=$(ls assets | grep -i "\.nsis\.zip$" | head -n 1 || ls assets | grep -i "\.msi\.zip$" | head -n 1 || echo "")
           LINUX_FILE=$(ls assets | grep -i "\.AppImage\.tar\.gz$" | head -n 1 || echo "")
-          MAC_ARM_FILE=$(ls assets | grep -i "aarch64\.app\.tar\.gz$" | head -n 1 || echo "")
-          MAC_X64_FILE=$(ls assets | grep -i "x64\.app\.tar\.gz$" | head -n 1 || echo "")
+          MAC_FILE=$(ls assets | grep -i "\.app\.tar\.gz$" | head -n 1 || echo "")
 
           # 서명 파일(.sig) 매칭
           WIN_SIG=$(cat assets/$WIN_FILE.sig 2>/dev/null || echo "")
           LINUX_SIG=$(cat assets/$LINUX_FILE.sig 2>/dev/null || echo "")
-          MAC_ARM_SIG=$(cat assets/$MAC_ARM_FILE.sig 2>/dev/null || echo "")
-          MAC_X64_SIG=$(cat assets/$MAC_X64_FILE.sig 2>/dev/null || echo "")
+          MAC_SIG=$(cat assets/$MAC_FILE.sig 2>/dev/null || echo "")
 
-          # URL 생성 (파일이 존재할 때만 생성)
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
           
-          # JSON 빌드 (빈 파일 예외 처리 포함)
-          JSON_CONTENT=$(cat <<EOF
-          {
-            "version": "$VERSION",
-            "notes": "CloudGameSaver $VERSION 업데이트가 준비되었습니다.",
-            "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-            "platforms": {}
-          }
-          EOF
-          )
+          # JSON 빌드
+          echo "{
+            \"version\": \"$VERSION\",
+            \"notes\": \"CloudGameSaver $VERSION 업데이트가 준비되었습니다.\",
+            \"pub_date\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
+            \"platforms\": {}
+          }" > latest.json
 
-          # 플랫폼 정보 동적 추가
+          # 각 플랫폼 정보 주입
           if [ -n "$WIN_FILE" ]; then
-            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"windows-x86_64\"] = {\"signature\": \"$WIN_SIG\", \"url\": \"$BASE_URL/$WIN_FILE\"}")
+            jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
           if [ -n "$LINUX_FILE" ]; then
-            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"linux-x86_64\"] = {\"signature\": \"$LINUX_SIG\", \"url\": \"$BASE_URL/$LINUX_FILE\"}")
+            jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
-          if [ -n "$MAC_ARM_FILE" ]; then
-            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"darwin-aarch64\"] = {\"signature\": \"$MAC_ARM_SIG\", \"url\": \"$BASE_URL/$MAC_ARM_FILE\"}")
-          fi
-          if [ -n "$MAC_X64_FILE" ]; then
-            JSON_CONTENT=$(echo \$JSON_CONTENT | jq ".platforms[\"darwin-x86_64\"] = {\"signature\": \"$MAC_X64_SIG\", \"url\": \"$BASE_URL/$MAC_X64_FILE\"}")
+          if [ -n "$MAC_FILE" ]; then
+            # Mac은 Universal 파일을 두 아키텍처에 공통 적용
+            jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
 
-          echo \$JSON_CONTENT > latest.json
-          
           echo "Generated latest.json content:"
           cat latest.json
           
