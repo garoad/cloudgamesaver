@@ -17,9 +17,9 @@ jobs:
           - platform: "macos-latest"
             args: "--target universal-apple-darwin"
           - platform: "ubuntu-22.04"
-            args: ""
+            args: "--target x86_64-unknown-linux-gnu"
           - platform: "windows-latest"
-            args: ""
+            args: "--target x86_64-pc-windows-msvc"
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -33,7 +33,7 @@ jobs:
       - name: install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || (matrix.platform == 'windows-latest' && 'x86_64-pc-windows-msvc' || 'x86_64-unknown-linux-gnu') }}
 
       - name: install dependencies (ubuntu only)
         if: matrix.platform == 'ubuntu-22.04'
@@ -63,8 +63,8 @@ jobs:
       - name: "[DEBUG] List Generated Files"
         shell: bash
         run: |
-          echo "=== Listing all files in src-tauri/target/release/bundle ==="
-          find src-tauri/target -name "bundle" -type d -exec find {} -maxdepth 3 \; || echo "No bundle directory found"
+          echo "=== Listing all files in src-tauri/target ==="
+          find src-tauri/target -maxdepth 10 \( -name "*.zip" -o -name "*.sig" -o -name "*.tar.gz" -o -name "*.exe" \)
 
   updater:
     needs: publish-tauri
@@ -95,32 +95,32 @@ jobs:
           TAG_NAME="v$VERSION"
           
           echo "Waiting for assets to settle..."
-          sleep 30
+          sleep 60
           
           mkdir -p assets
           gh release download $TAG_NAME --dir assets --clobber || echo "No assets found yet"
           
           echo "--- All Downloaded Assets ---"
           ls -R assets
-          echo "----------------------------"
-
-          # 유연한 패턴 매칭
-          WIN_FILE=$(ls assets | grep -iE "\.nsis\.zip$|\.msi\.zip$|\.zip$" | grep -iv "source" | head -n 1 || echo "")
-          LINUX_FILE=$(ls assets | grep -iE "\.AppImage\.tar\.gz$|\.AppImage$" | head -n 1 || echo "")
+          
+          # 파일 매칭 로직 (업데이터 전용 번들 우선)
+          WIN_FILE=$(ls assets | grep -iE "\.nsis\.zip$|\.msi\.zip$" | head -n 1 || echo "")
+          # 만약 위에서 못 찾았다면 일반 .zip 검색 (단, sig 파일이 있는 것만)
+          if [ -z "$WIN_FILE" ]; then
+            for f in $(ls assets | grep -i "\.zip$"); do
+              if [ -f "assets/$f.sig" ]; then WIN_FILE=$f; break; fi
+            done
+          fi
+          
+          LINUX_FILE=$(ls assets | grep -iE "\.AppImage\.tar\.gz$" | head -n 1 || echo "")
           MAC_FILE=$(ls assets | grep -iE "\.app\.tar\.gz$" | head -n 1 || echo "")
 
-          echo "DEBUG: Detected WIN_FILE=$WIN_FILE"
-          echo "DEBUG: Detected LINUX_FILE=$LINUX_FILE"
-          echo "DEBUG: Detected MAC_FILE=$MAC_FILE"
-
-          # 서명 파일 검색 및 내용 읽기
+          # 서명 읽기
           WIN_SIG=$(cat assets/$WIN_FILE.sig 2>/dev/null || echo "")
           LINUX_SIG=$(cat assets/$LINUX_FILE.sig 2>/dev/null || echo "")
           MAC_SIG=$(cat assets/$MAC_FILE.sig 2>/dev/null || echo "")
 
-          echo "DEBUG: WIN_SIG_LENGTH=${#WIN_SIG}"
-          echo "DEBUG: LINUX_SIG_LENGTH=${#LINUX_SIG}"
-          echo "DEBUG: MAC_SIG_LENGTH=${#MAC_SIG}"
+          echo "DEBUG: WIN=$WIN_FILE, LINUX=$LINUX_FILE, MAC=$MAC_FILE"
 
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
           
@@ -132,19 +132,15 @@ jobs:
             \"platforms\": {}
           }" > latest.json
 
-          # 각 플랫폼 추가 (파일이 있을 때만)
-          if [ -n "$WIN_FILE" ]; then
+          if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
             jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
-          if [ -n "$LINUX_FILE" ]; then
+          if [ -n "$LINUX_FILE" ] && [ -n "$LINUX_SIG" ]; then
             jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
-          if [ -n "$MAC_FILE" ]; then
+          if [ -n "$MAC_FILE" ] && [ -n "$MAC_SIG" ]; then
             jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
           fi
 
-          echo "--- Final latest.json ---"
           cat latest.json
-          echo "------------------------"
-          
           gh release upload $TAG_NAME latest.json --clobber
