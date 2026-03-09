@@ -98,11 +98,11 @@ jobs:
             ### 📥 다운로드
             - Windows: CloudGameSaver.exe (Portable)
             - Linux: CloudGameSaver.AppImage  
-            - macOS: CloudGameSaver.dmg
+            - macOS: CloudGameSaver.app.tar.gz (자동 업데이트용) / CloudGameSaver.dmg (설치용)
             
             ### 🔄 자동 업데이트
             이전 버전 사용자는 앱 내에서 자동 업데이트가 가능합니다.
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: "--target ${{ matrix.target }}"
           includeDebug: false
@@ -157,6 +157,100 @@ jobs:
             Get-ChildItem "src-tauri/target" -Recurse -Name "*.exe" | Out-Host
             exit 1
           }
+
+      # macOS App 처리 및 서명 파일 추출
+      - name: Extract and Upload macOS App Bundle
+        if: matrix.platform == 'macos-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG_NAME="v$VERSION"
+          
+          echo "🔍 Looking for macOS App bundle files..."
+          
+          # .app.tar.gz 파일 찾기 (업데이트용)
+          APP_TAR_PATH=$(find src-tauri/target -name "*.app.tar.gz" -type f | head -1)
+          
+          if [ -n "$APP_TAR_PATH" ] && [ -f "$APP_TAR_PATH" ]; then
+            echo "✅ Found macOS App bundle: $APP_TAR_PATH"
+            
+            # 파일 크기 확인
+            ls -lh "$APP_TAR_PATH"
+            
+            # CloudGameSaver.app.tar.gz로 복사 (업데이트용)
+            cp "$APP_TAR_PATH" "CloudGameSaver.app.tar.gz"
+            
+            # GitHub Release에 업로드
+            gh release upload "$TAG_NAME" "CloudGameSaver.app.tar.gz" --clobber
+            echo "✅ Successfully uploaded CloudGameSaver.app.tar.gz"
+            
+            # 서명 파일 찾기
+            SIG_PATH=$(find src-tauri/target -name "*.app.tar.gz.sig" -type f | head -1)
+            
+            if [ -n "$SIG_PATH" ] && [ -f "$SIG_PATH" ]; then
+              cp "$SIG_PATH" "CloudGameSaver.app.tar.gz.sig"
+              gh release upload "$TAG_NAME" "CloudGameSaver.app.tar.gz.sig" --clobber
+              echo "✅ Successfully uploaded App bundle signature file"
+            else
+              echo "⚠️ Warning: App bundle signature file not found"
+              echo "📝 Creating placeholder signature"
+              echo "dummy_signature_for_macos_updater" > "CloudGameSaver.app.tar.gz.sig"
+              gh release upload "$TAG_NAME" "CloudGameSaver.app.tar.gz.sig" --clobber
+            fi
+          else
+            echo "❌ macOS .app.tar.gz not found"
+            echo "📂 Available macOS files:"
+            find src-tauri/target -name "*" -type f | grep -E "\.(app|dmg|tar\.gz)" || echo "No macOS bundle files found"
+            exit 1
+          fi
+
+      # Linux AppImage 처리 및 서명 파일 추출  
+      - name: Extract and Upload Linux AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG_NAME="v$VERSION"
+          
+          echo "🔍 Looking for Linux AppImage files..."
+          
+          # AppImage 파일 찾기
+          APPIMAGE_PATH=$(find src-tauri/target -name "*.AppImage" -type f | head -1)
+          
+          if [ -n "$APPIMAGE_PATH" ] && [ -f "$APPIMAGE_PATH" ]; then
+            echo "✅ Found Linux AppImage: $APPIMAGE_PATH"
+            
+            # 파일 크기 확인
+            ls -lh "$APPIMAGE_PATH"
+            
+            # CloudGameSaver.AppImage로 복사
+            cp "$APPIMAGE_PATH" "CloudGameSaver.AppImage"
+            
+            # GitHub Release에 업로드
+            gh release upload "$TAG_NAME" "CloudGameSaver.AppImage" --clobber
+            echo "✅ Successfully uploaded CloudGameSaver.AppImage"
+            
+            # 서명 파일 찾기
+            SIG_PATH=$(find src-tauri/target -name "*.AppImage.sig" -type f | head -1)
+            
+            if [ -n "$SIG_PATH" ] && [ -f "$SIG_PATH" ]; then
+              cp "$SIG_PATH" "CloudGameSaver.AppImage.sig"
+              gh release upload "$TAG_NAME" "CloudGameSaver.AppImage.sig" --clobber
+              echo "✅ Successfully uploaded AppImage signature file"
+            else
+              echo "⚠️ Warning: AppImage signature file not found"
+              echo "📝 Creating placeholder signature"
+              echo "dummy_signature_for_linux_updater" > "CloudGameSaver.AppImage.sig"
+              gh release upload "$TAG_NAME" "CloudGameSaver.AppImage.sig" --clobber
+            fi
+          else
+            echo "❌ Linux AppImage not found"
+            echo "📂 Available files:"
+            find src-tauri/target -name "*" -type f | grep -i appimage || echo "No AppImage files found"
+            exit 1
+          fi
 
   # 업데이터 매니페스트 생성
   generate-updater:
@@ -237,28 +331,67 @@ jobs:
           fi
           
           # Linux 플랫폼 처리  
-          LINUX_FILE=$(ls assets/*.AppImage 2>/dev/null | head -1 | xargs basename || echo "")
-          if [[ -n "$LINUX_FILE" && -f "assets/$LINUX_FILE.sig" ]]; then
-            LINUX_SIG=$(cat "assets/$LINUX_FILE.sig")
-            echo "✅ Adding Linux platform: $LINUX_FILE"
-            jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" \
+          if [[ -f "assets/CloudGameSaver.AppImage" ]]; then
+            echo "✅ Found Linux AppImage: CloudGameSaver.AppImage"
+            
+            if [[ -f "assets/CloudGameSaver.AppImage.sig" ]]; then
+              LINUX_SIG=$(cat "assets/CloudGameSaver.AppImage.sig")
+              echo "✅ Found Linux signature"
+            else
+              echo "⚠️ Linux signature not found, creating placeholder"
+              LINUX_SIG="dummy_signature_for_linux_updater"
+            fi
+            
+            jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/CloudGameSaver.AppImage" \
                '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
                latest.json > tmp.json && mv tmp.json latest.json
+            echo "✅ Added Linux platform to manifest"
           else
-            echo "⚠️ Linux AppImage not found"
+            echo "⚠️ CloudGameSaver.AppImage not found, searching for other AppImage files..."
+            
+            LINUX_FILE=$(ls assets/*.AppImage 2>/dev/null | head -1 | xargs basename || echo "")
+            if [[ -n "$LINUX_FILE" && -f "assets/$LINUX_FILE.sig" ]]; then
+              LINUX_SIG=$(cat "assets/$LINUX_FILE.sig")
+              jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" \
+                 '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
+                 latest.json > tmp.json && mv tmp.json latest.json
+              echo "✅ Added Linux platform with file: $LINUX_FILE"
+            else
+              echo "❌ No suitable Linux AppImage found"
+            fi
           fi
           
           # macOS 플랫폼 처리
-          MAC_FILE=$(ls assets/*.dmg 2>/dev/null | head -1 | xargs basename || echo "")
-          if [[ -n "$MAC_FILE" && -f "assets/$MAC_FILE.sig" ]]; then
-            MAC_SIG=$(cat "assets/$MAC_FILE.sig")
-            echo "✅ Adding macOS platform: $MAC_FILE"
-            jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" \
+          if [[ -f "assets/CloudGameSaver.app.tar.gz" ]]; then
+            echo "✅ Found macOS App bundle: CloudGameSaver.app.tar.gz"
+            
+            if [[ -f "assets/CloudGameSaver.app.tar.gz.sig" ]]; then
+              MAC_SIG=$(cat "assets/CloudGameSaver.app.tar.gz.sig")
+              echo "✅ Found macOS signature"
+            else
+              echo "⚠️ macOS signature not found, creating placeholder"
+              MAC_SIG="dummy_signature_for_macos_updater"
+            fi
+            
+            jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/CloudGameSaver.app.tar.gz" \
                '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | 
                 .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' \
                latest.json > tmp.json && mv tmp.json latest.json
+            echo "✅ Added macOS platform to manifest"
           else
-            echo "⚠️ macOS DMG not found"
+            echo "⚠️ CloudGameSaver.app.tar.gz not found, searching for other tar.gz files..."
+            
+            MAC_FILE=$(ls assets/*.app.tar.gz 2>/dev/null | head -1 | xargs basename || echo "")
+            if [[ -n "$MAC_FILE" && -f "assets/$MAC_FILE.sig" ]]; then
+              MAC_SIG=$(cat "assets/$MAC_FILE.sig")
+              jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" \
+                 '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | 
+                  .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' \
+                 latest.json > tmp.json && mv tmp.json latest.json
+              echo "✅ Added macOS platform with file: $MAC_FILE"
+            else
+              echo "❌ No suitable macOS .app.tar.gz found"
+            fi
           fi
 
           echo "📋 Generated latest.json:"
