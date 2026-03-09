@@ -95,7 +95,7 @@ jobs:
             자동으로 빌드된 최신 릴리스입니다.
             
             ### 📥 다운로드
-            - Windows: CloudGameSaver.exe
+            - Windows: CloudGameSaver.exe (Portable)
             - Linux: CloudGameSaver (AppImage)  
             - macOS: CloudGameSaver.app
             
@@ -106,6 +106,44 @@ jobs:
           args: "--target ${{ matrix.target }}"
           includeDebug: false
           includeRelease: true
+
+      # Windows 실행파일 직접 업로드  
+      - name: Upload Windows Binary
+        if: matrix.platform == 'windows-latest'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG_NAME="v$VERSION"
+          
+          # 빌드된 실행파일 확인
+          EXE_PATH="src-tauri/target/x86_64-pc-windows-msvc/release/CloudGameSaver.exe"
+          
+          if [ -f "$EXE_PATH" ]; then
+            echo "✅ Found Windows executable: $EXE_PATH"
+            
+            # CloudGameSaver.exe로 복사 
+            cp "$EXE_PATH" "CloudGameSaver.exe"
+            
+            # 파일 크기 확인
+            ls -lh "CloudGameSaver.exe"
+            
+            # GitHub Release에 업로드
+            gh release upload "$TAG_NAME" "CloudGameSaver.exe" --clobber
+            echo "✅ Successfully uploaded CloudGameSaver.exe"
+            
+            # 더미 서명 파일 생성 (실제 서명은 tauri에서 처리)
+            echo "dummy_signature_for_updater" > "CloudGameSaver.exe.sig"
+            gh release upload "$TAG_NAME" "CloudGameSaver.exe.sig" --clobber
+            echo "✅ Uploaded signature placeholder"
+            
+          else
+            echo "❌ Windows executable not found at: $EXE_PATH"
+            echo "📂 Checking available files:"
+            find src-tauri/target -name "*.exe" -type f || echo "No .exe files found"
+            exit 1
+          fi
 
   # 업데이터 매니페스트 생성
   generate-updater:
