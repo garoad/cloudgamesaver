@@ -231,7 +231,10 @@ async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Result<
     let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({"path": path}))
+        .json(&serde_json::json!({
+            "path": path,
+            "recursive": true
+        }))
         .send().await.map_err(|e| e.to_string())?;
     
     if res.status().is_success() {
@@ -242,6 +245,27 @@ async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Result<
         let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
         Err(format!("ERR_CODE:{} | 클라우드 파일 목록 조회 실패 ({}): {}", err_code, path, err_text))
     }
+}
+
+async fn get_local_files_recursive(base_path: &std::path::Path, current_path: &std::path::Path) -> Vec<(String, PathBuf)> {
+    let mut files = Vec::new();
+    if let Ok(mut entries) = tokio::fs::read_dir(current_path).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path.is_dir() {
+                let sub_files = Box::pin(get_local_files_recursive(base_path, &path)).await;
+                files.extend(sub_files);
+            } else {
+                if let Ok(rel_path) = path.strip_prefix(base_path) {
+                    if let Some(rel_str) = rel_path.to_str() {
+                        // 윈도우 경로 구분자를 슬래시로 통일
+                        files.push((rel_str.replace("\\", "/"), path));
+                    }
+                }
+            }
+        }
+    }
+    files
 }
 
 async fn upload_to_dropbox(client: &Client, token: &str, local_file: PathBuf, remote_path: String) -> Result<(), String> {
@@ -276,6 +300,8 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         if !items[i].enabled { continue; }
         
         let mut current_token = items[i].token.clone();
+        let cloud_base = items[i].cloud_path.trim_end_matches('/').to_lowercase();
+        
         let res = list_dropbox_files(&client, &current_token, &items[i].cloud_path).await;
         
         let remote_files = match res {
@@ -302,17 +328,28 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         let local_dir = PathBuf::from(&items[i].local_path);
         if !local_dir.exists() { let _ = tokio::fs::create_dir_all(&local_dir).await; }
         
-        let mut remote_file_names = HashSet::new();
+        let mut remote_rel_paths = HashSet::new();
         for remote_file in remote_files {
-            let file_name = remote_file.name.clone();
-            remote_file_names.insert(file_name.clone());
-            let local_path = local_dir.join(&file_name);
-            let remote_path = format!("{}/{}", items[i].cloud_path.trim_end_matches('/'), file_name);
+            let remote_path = remote_file.path_display.clone().unwrap_or_default();
+            let remote_path_lower = remote_path.to_lowercase();
+            
+            // cloud_path 기준 상대 경로 추출
+            let rel_path = if remote_path_lower.starts_with(&cloud_base) {
+                let p = &remote_path[cloud_base.len()..];
+                p.trim_start_matches('/').to_string()
+            } else {
+                remote_file.name.clone()
+            };
+
+            if rel_path.is_empty() { continue; }
+            
+            remote_rel_paths.insert(rel_path.clone());
+            let local_path = local_dir.join(rel_path.replace("/", "\\"));
             let remote_hash = remote_file.content_hash.clone().unwrap_or_default();
             
             if !local_path.exists() {
-                println!("[Sync] 신규 다운로드 감지: {}", file_name);
-                total_tasks.push(("down", current_token.clone(), remote_path, local_path, file_name));
+                println!("[Sync] 신규 다운로드 감지: {}", rel_path);
+                total_tasks.push(("down", current_token.clone(), remote_path, local_path, rel_path));
             } else {
                 let local_hash = compute_dropbox_hash(&local_path).await;
                 if local_hash != remote_hash {
@@ -324,29 +361,26 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                     if let Ok(metadata) = tokio::fs::metadata(&local_path).await {
                         if let Ok(modified) = metadata.modified() {
                             let local_modified: DateTime<Utc> = modified.into();
-                            println!("[Sync] 해시 불일치 ({}): 로컬={}, 서버={}", file_name, local_modified, remote_modified);
+                            println!("[Sync] 해시 불일치 ({}): 로컬={}, 서버={}", rel_path, local_modified, remote_modified);
                             if remote_modified > local_modified {
-                                total_tasks.push(("down", current_token.clone(), remote_path, local_path, file_name));
+                                total_tasks.push(("down", current_token.clone(), remote_path, local_path, rel_path));
                             } else {
-                                total_tasks.push(("up", current_token.clone(), remote_path, local_path, file_name));
+                                total_tasks.push(("up", current_token.clone(), remote_path, local_path, rel_path));
                             }
                         }
                     }
                 } else {
-                    println!("[Sync] 파일 일치 (해시 동일): {}", file_name);
+                    println!("[Sync] 파일 일치 (해시 동일): {}", rel_path);
                 }
             }
         }
 
-        if let Ok(mut entries) = tokio::fs::read_dir(&local_dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.is_dir() { continue; }
-                let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
-                if !remote_file_names.contains(&file_name) {
-                    let remote_path = format!("{}/{}", items[i].cloud_path.trim_end_matches('/'), file_name);
-                    total_tasks.push(("up", current_token.clone(), remote_path, path, file_name));
-                }
+        // 로컬 파일 재귀 스캔
+        let local_files = get_local_files_recursive(&local_dir, &local_dir).await;
+        for (rel_path, path) in local_files {
+            if !remote_rel_paths.contains(&rel_path) {
+                let remote_path = format!("{}/{}", items[i].cloud_path.trim_end_matches('/'), rel_path);
+                total_tasks.push(("up", current_token.clone(), remote_path, path, rel_path));
             }
         }
     }
@@ -377,11 +411,19 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         let pc = processed_count.clone();
         
         worker_tasks.push(async move {
-            let _res = if action == "up" {
+            let res = if action == "up" {
                 upload_to_dropbox(&client, &token, local_path, remote_path).await
             } else {
+                // 다운로드 시 부모 디렉토리 생성 보장
+                if let Some(parent) = local_path.parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
                 download_from_dropbox(&client, &token, remote_path, local_path).await
             };
+            
+            if let Err(e) = res {
+                println!("[Sync Error] {} 처리 중 오류: {}", file_name, e);
+            }
             
             {
                 let mut p = pc.lock().unwrap();

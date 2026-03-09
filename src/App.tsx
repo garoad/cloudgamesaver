@@ -40,24 +40,32 @@ export default function App() {
     await message("드롭박스 인증 세션이 만료되었습니다. 보안을 위해 다시 연결이 필요합니다.", { title: '알림', kind: 'warning' });
   };
 
-  // 업데이트 확인 로직
-  const checkForUpdates = async (manual = false) => {
+  // 업데이트 확인 로직 (재시도 및 에러 처리 개선)
+  const checkForUpdates = async (manual = false, retryCount = 0) => {
     if (loading) return;
+    
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 2000; // 2초
+    
     try {
       if (manual) setStatus("업데이트 확인 중...");
+      else if (retryCount === 0) console.log("🔄 자동 업데이트 확인 중...");
+      
       const update = await check();
       
       if (update) {
+        console.log(`✅ 새 버전 발견: ${update.version}`);
         if (manual) setStatus(""); 
         const shouldUpdate = await ask(
-          `새로운 버전(${update.version})이 있습니다. 업데이트하시겠습니까?\n\n내용: ${update.body}`,
-          { title: '업데이트 알림', kind: 'info' }
+          `새로운 버전(${update.version})이 있습니다. 업데이트하시겠습니까?\n\n변경사항:\n${update.body || '개선사항 및 버그 수정'}`,
+          { title: '업데이트 발견!', kind: 'info' }
         );
         
         if (shouldUpdate) {
           setLoading(true);
           setIsUpdating(true);
           setProgress(0);
+          setStatus("업데이트 다운로드 중...");
           
           let downloaded = 0;
           let contentLength = 0;
@@ -67,34 +75,74 @@ export default function App() {
               switch (event.event) {
                 case 'Started':
                   contentLength = event.data.contentLength || 0;
-                  setStatus("업데이트 다운로드 중...");
-                  console.log(`Update started: ${contentLength} bytes`);
+                  setStatus(`업데이트 다운로드 중... (${Math.round(contentLength/1024/1024)}MB)`);
+                  console.log(`📦 업데이트 시작: ${contentLength} bytes`);
                   break;
                 case 'Progress':
                   downloaded += event.data.chunkLength;
-                  if (contentLength > 0) setProgress((downloaded / contentLength) * 100);
+                  if (contentLength > 0) {
+                    const progressPercent = (downloaded / contentLength) * 100;
+                    setProgress(progressPercent);
+                    if (progressPercent % 10 < 1) { // 10%마다 로그
+                      console.log(`📊 다운로드 진행률: ${Math.round(progressPercent)}%`);
+                    }
+                  }
                   break;
                 case 'Finished':
-                  setStatus("설치 완료! 재시작 중...");
+                  setStatus("설치 완료! 잠시 후 재시작됩니다...");
+                  console.log("✅ 업데이트 설치 완료");
                   break;
               }
             });
             
-            // 설치 완료 후 즉시 재시작
-            await relaunch();
+            // 설치 완료 후 재시작
+            setTimeout(async () => {
+              await relaunch();
+            }, 1500);
+            
           } catch (installError) {
-            console.error("Installation failed:", installError);
-            await message(`업데이트 설치 중 오류가 발생했습니다: ${installError}`, { title: '설치 에러', kind: 'error' });
+            console.error("❌ 설치 실패:", installError);
+            await message(`업데이트 설치 중 오류가 발생했습니다:\n\n${installError}\n\n나중에 다시 시도해주세요.`, { 
+              title: '설치 에러', 
+              kind: 'error' 
+            });
           }
         }
       } else {
-        if (manual) await message("현재 최신 버전을 사용 중입니다.", { title: '업데이트 확인', kind: 'info' });
+        console.log("✅ 최신 버전 사용 중");
+        if (manual) {
+          await message("현재 최신 버전을 사용 중입니다.", { 
+            title: '업데이트 확인', 
+            kind: 'info' 
+          });
+        }
       }
     } catch (e) {
-      console.error("Update check error:", e);
       const errorStr = String(e);
+      console.error("❌ 업데이트 확인 오류:", errorStr);
+      
+      // 네트워크 오류 등으로 재시도 가능한 경우
+      if (retryCount < MAX_RETRIES && !manual) {
+        console.log(`🔄 업데이트 확인 재시도... (${retryCount + 1}/${MAX_RETRIES})`);
+        setTimeout(() => {
+          checkForUpdates(false, retryCount + 1);
+        }, RETRY_DELAY);
+        return;
+      }
+      
+      // 수동 확인이거나 재시도 횟수 초과 시 사용자에게 알림
       if (manual) {
-        await message(`업데이트 확인 중 오류가 발생했습니다: ${errorStr}`, { title: '에러', kind: 'error' });
+        if (errorStr.includes('network') || errorStr.includes('fetch')) {
+          await message('네트워크 연결을 확인하고 다시 시도해주세요.', { 
+            title: '연결 오류', 
+            kind: 'error' 
+          });
+        } else {
+          await message(`업데이트 확인 중 오류가 발생했습니다:\n\n${errorStr}`, { 
+            title: '업데이트 확인 실패', 
+            kind: 'error' 
+          });
+        }
       }
     } finally {
       setLoading(false);
@@ -104,10 +152,17 @@ export default function App() {
   };
 
   useEffect(() => {
+    // 앱 시작 시 자동 업데이트 확인
     if (!hasCheckedUpdate.current) {
       hasCheckedUpdate.current = true;
-      setTimeout(() => checkForUpdates(false), 1000);
+      setTimeout(() => checkForUpdates(false), 2000); // 2초 후 확인
     }
+    
+    // 정기적인 업데이트 확인 (30분마다)
+    const updateInterval = setInterval(() => {
+      console.log("⏰ 정기 업데이트 확인 실행");
+      checkForUpdates(false);
+    }, 30 * 60 * 1000); // 30분
 
     const saved = localStorage.getItem("sync-items");
     const token = localStorage.getItem("dropbox-token");
@@ -168,6 +223,7 @@ export default function App() {
     });
 
     return () => {
+      clearInterval(updateInterval);
       unConnect.then(f => f());
       unTokenUpdated.then(f => f());
       unProgress.then(f => f());
@@ -307,28 +363,100 @@ export default function App() {
         <div className="loading-overlay">
           <div className="loading-card">
             <div className="spinner"></div>
-            <h3>{isUpdating ? "업데이트 진행 중..." : "동기화 진행 중..."}</h3>
+            <h3>
+              {isUpdating ? "🔄 업데이트 진행 중..." : "📁 동기화 진행 중..."}
+            </h3>
             <div className="progress-container">
-              <div className="progress-bar" style={{ width: `${progress}%` }}></div>
+              <div className="progress-bar" style={{ 
+                width: `${progress}%`,
+                background: isUpdating ? "#2196F3" : "#4CAF50"
+              }}></div>
             </div>
-            {!isUpdating && <p className="current-file">{currentFile}</p>}
-            <p className="progress-text">{Math.round(progress)}% 완료</p>
-            {!isUpdating && <button onClick={handleCancel} className="cancel-btn">동기화 취소</button>}
+            {isUpdating ? (
+              <div>
+                <p className="progress-text">
+                  {Math.round(progress)}% 다운로드 완료
+                </p>
+                <small style={{color: "#666", display: "block", marginTop: "5px"}}>
+                  업데이트가 완료되면 자동으로 재시작됩니다.
+                </small>
+              </div>
+            ) : (
+              <div>
+                <p className="current-file">{currentFile}</p>
+                <p className="progress-text">{Math.round(progress)}% 완료</p>
+                <button onClick={handleCancel} className="cancel-btn">동기화 취소</button>
+              </div>
+            )}
           </div>
         </div>
       )}
 
       <header>
-        <h1>CloudGameSaver</h1>
-        <p className="subtitle">드롭박스와 게임 세이브를 완벽하게 동기화하세요.</p>
+        <div style={{textAlign: "center"}}>
+          <h1>CloudGameSaver</h1>
+          <p className="subtitle">드롭박스와 게임 세이브를 완벽하게 동기화하세요.</p>
+        </div>
       </header>
       
       <div className="settings-section">
-        <div style={{display: "flex", justifyContent: "space-between", alignItems: "center"}}>
-          <button onClick={handleConnect} className="auth-btn" style={{width: "auto"}}>
-            {dropboxToken ? "✅ 드롭박스 연결됨" : "🔗 드롭박스 연결하기"}
+        <div style={{display: "flex", justifyContent: "space-between", alignItems: "center", gap: "10px", flexWrap: "wrap"}}>
+          <div style={{display: "flex", gap: "8px", flexShrink: 1}}>
+            <button onClick={handleConnect} className="auth-btn" style={{
+              padding: "8px 12px", 
+              fontSize: "14px",
+              maxWidth: dropboxToken ? "120px" : "150px",
+              whiteSpace: "nowrap",
+              overflow: "hidden",
+              textOverflow: "ellipsis"
+            }}>
+              {dropboxToken ? "✅ 연결됨" : "🔗 드롭박스 연결"}
+            </button>
+            {dropboxToken && (
+              <button 
+                onClick={() => fetchCloudFolders(dropboxToken)} 
+                className="secondary-btn"
+                style={{
+                  padding: "8px 12px",
+                  fontSize: "14px",
+                  width: "90px",
+                  whiteSpace: "nowrap"
+                }}
+              >
+                목록 갱신
+              </button>
+            )}
+          </div>
+          <button 
+            onClick={() => checkForUpdates(true)} 
+            disabled={loading} 
+            className="update-check-btn" 
+            style={{
+              padding: "8px 12px", 
+              fontSize: "14px",
+              background: loading ? "#ddd" : "#2196F3",
+              border: "none",
+              borderRadius: "6px",
+              color: "white",
+              cursor: loading ? "not-allowed" : "pointer",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              width: "140px",
+              justifyContent: "center",
+              transition: "all 0.2s",
+              flexShrink: 0,
+              whiteSpace: "nowrap"
+            }}
+            onMouseEnter={(e) => {
+              if (!loading) e.currentTarget.style.background = "#1976D2";
+            }}
+            onMouseLeave={(e) => {
+              if (!loading) e.currentTarget.style.background = "#2196F3";
+            }}
+          >
+            🔄 업데이트 확인
           </button>
-          {dropboxToken && <button onClick={() => fetchCloudFolders(dropboxToken)} className="secondary-btn">목록 갱신</button>}
         </div>
       </div>
 
@@ -368,9 +496,17 @@ export default function App() {
       </div>
 
       <div className="action-section">
-        <button className="sync-btn" onClick={syncAll} disabled={loading}>동기화 시작</button>
-        <button className="update-check-btn" onClick={() => checkForUpdates(true)} disabled={loading}>🔄 업데이트 확인</button>
-        <div className="status-box"><pre>{status || "준비 완료"}</pre></div>
+        <button className="sync-btn" onClick={syncAll} disabled={loading}>
+          {loading && !isUpdating ? "동기화 진행 중..." : "동기화 시작"}
+        </button>
+        <div className="status-box">
+          <pre>{status || "준비 완료"}</pre>
+          {status && status.includes("완료") && !loading && (
+            <small style={{color: "#4CAF50", display: "block", marginTop: "5px"}}>
+              ✅ 작업이 성공적으로 완료되었습니다.
+            </small>
+          )}
+        </div>
       </div>
     </div>
   );

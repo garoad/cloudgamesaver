@@ -1,51 +1,85 @@
-name: "Publish Release"
+name: "Auto Release & Update"
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - ".gitignore"
+      - "LICENSE"
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  publish-tauri:
+  build-and-release:
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - platform: "macos-latest"
-            target: "universal-apple-darwin"
-          - platform: "ubuntu-22.04"
-            target: "x86_64-unknown-linux-gnu"
           - platform: "windows-latest"
             target: "x86_64-pc-windows-msvc"
+            os-name: "windows-x86_64"
+            artifact-name: "CloudGameSaver.exe"
+          - platform: "ubuntu-22.04" 
+            target: "x86_64-unknown-linux-gnu"
+            os-name: "linux-x86_64"
+            artifact-name: "CloudGameSaver"
+          - platform: "macos-latest"
+            target: "universal-apple-darwin"
+            os-name: "darwin-universal"
+            artifact-name: "CloudGameSaver.app"
 
     runs-on: ${{ matrix.platform }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup node
+      - name: Get Version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      # Node.js 캐싱
+      - name: Setup Node.js with cache
         uses: actions/setup-node@v4
         with:
-          node-version: lts/*
+          node-version: 'lts/*'
+          cache: 'npm'
 
-      - name: install Rust stable
+      # Rust 캐싱  
+      - name: Setup Rust with cache
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
 
-      - name: install dependencies (ubuntu only)
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      # Linux 종속성
+      - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: install frontend dependencies
-        run: npm install
+      # 프론트엔드 종속성 설치
+      - name: Install dependencies
+        run: npm ci
 
-      - name: Build and Publish
-        uses: tauri-apps/tauri-action@v0
+      # Tauri 빌드 및 릴리스
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -53,98 +87,109 @@ jobs:
           APP_KEY: ${{ secrets.APP_KEY }}
           APP_SECRET: ${{ secrets.APP_SECRET }}
         with:
-          tagName: v__VERSION__
-          releaseName: "CloudGameSaver v__VERSION__"
-          releaseBody: "자동으로 빌드된 릴리즈입니다."
-          releaseDraft: true
+          tagName: "v${{ steps.version.outputs.version }}"
+          releaseName: "CloudGameSaver v${{ steps.version.outputs.version }}"
+          releaseBody: |
+            ## 🚀 CloudGameSaver v${{ steps.version.outputs.version }}
+            
+            자동으로 빌드된 최신 릴리스입니다.
+            
+            ### 📥 다운로드
+            - Windows: CloudGameSaver.exe
+            - Linux: CloudGameSaver (AppImage)  
+            - macOS: CloudGameSaver.app
+            
+            ### 🔄 자동 업데이트
+            이전 버전 사용자는 앱 내에서 자동 업데이트가 가능합니다.
+          releaseDraft: false
           prerelease: false
           args: "--target ${{ matrix.target }}"
+          includeDebug: false
+          includeRelease: true
 
-  updater:
-    needs: publish-tauri
+  # 업데이터 매니페스트 생성
+  generate-updater:
+    needs: build-and-release
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: setup node
-        uses: actions/setup-node@v4
+      - name: Setup Node.js
+        uses: actions/setup-node@v4 
         with:
-          node-version: lts/*
+          node-version: 'lts/*'
 
-      - name: install tauri-cli
-        run: npm install -g @tauri-apps/cli
-
-      - name: Get Version
-        id: get_version
-        run: |
-          echo "VERSION=$(node -p "require('./package.json').version")" >> $GITHUB_OUTPUT
-
-      - name: Generate latest.json
+      - name: Generate updater manifest
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION="${{ steps.get_version.outputs.VERSION }}"
+          VERSION="${{ needs.build-and-release.outputs.version }}"
           TAG_NAME="v$VERSION"
           
+          echo "🔄 Generating updater manifest for $TAG_NAME..."
+          
+          # 잠시 대기 (릴리스 완료 확인)
+          sleep 30
+          
+          # 릴리스 에셋 다운로드
           mkdir -p assets
-          gh release download $TAG_NAME --dir assets --clobber || true
+          gh release download "$TAG_NAME" --dir assets --pattern "*.exe" --pattern "*.sig" --pattern "CloudGameSaver" --pattern "*.app" || true
           
-          echo "=== Downloaded Assets List ==="
-          ls -F assets
+          echo "📦 Downloaded assets:"
+          ls -la assets/ || echo "No assets found"
           
-          # 1. 윈도우 파일 찾기 (.exe + .exe.sig 쌍 확인)
-          for f in $(ls assets | grep -iE "\.exe$"); do
-            if [ -f "assets/$f.sig" ]; then
-              WIN_FILE=$f
-              WIN_SIG=$(cat "assets/$f.sig")
-              echo "Found Windows Asset: $f"
-              break
-            fi
-          done
-
-          # 2. 리눅스 파일 찾기 (.AppImage + .AppImage.sig 쌍 확인)
-          for f in $(ls assets | grep -iE "\.AppImage$"); do
-            if [ -f "assets/$f.sig" ]; then
-              LINUX_FILE=$f
-              LINUX_SIG=$(cat "assets/$f.sig")
-              echo "Found Linux Asset: $f"
-              break
-            fi
-          done
-
-          # 3. 맥 파일 찾기 (.app.tar.gz + .sig 쌍 확인)
-          for f in $(ls assets | grep -iE "\.app\.tar\.gz$"); do
-            if [ -f "assets/$f.sig" ]; then
-              MAC_FILE=$f
-              MAC_SIG=$(cat "assets/$f.sig")
-              echo "Found macOS Asset: $f"
-              break
-            fi
-          done
+          # latest.json 생성
+          cat > latest.json << EOF
+          {
+            "version": "$VERSION",
+            "notes": "CloudGameSaver $VERSION 업데이트가 준비되었습니다.\\n\\n새로운 기능과 개선사항을 확인해보세요!",
+            "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "platforms": {}
+          }
+          EOF
 
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
           
-          echo "{
-            \"version\": \"$VERSION\",
-            \"notes\": \"CloudGameSaver $VERSION 업데이트가 준비되었습니다.\",
-            \"pub_date\": \"$(date -u +"%Y-%m-%dT%H:%M:%SZ")\",
-            \"platforms\": {}
-          }" > latest.json
+          # Windows 플랫폼 처리
+          if [[ -f "assets/CloudGameSaver.exe" && -f "assets/CloudGameSaver.exe.sig" ]]; then
+            WIN_SIG=$(cat "assets/CloudGameSaver.exe.sig")
+            echo "✅ Adding Windows platform"
+            jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/CloudGameSaver.exe" \
+               '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' \
+               latest.json > tmp.json && mv tmp.json latest.json
+          else
+            echo "⚠️  Windows assets not found"
+          fi
+          
+          # Linux 플랫폼 처리  
+          if [[ -f "assets/CloudGameSaver" && -f "assets/CloudGameSaver.sig" ]]; then
+            LINUX_SIG=$(cat "assets/CloudGameSaver.sig")
+            echo "✅ Adding Linux platform"
+            jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/CloudGameSaver" \
+               '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
+               latest.json > tmp.json && mv tmp.json latest.json
+          else
+            echo "⚠️  Linux assets not found"
+          fi
+          
+          # macOS 플랫폼 처리
+          APP_FILE=$(ls assets/*.app 2>/dev/null | head -1 | xargs basename || echo "")
+          if [[ -n "$APP_FILE" && -f "assets/$APP_FILE.sig" ]]; then
+            MAC_SIG=$(cat "assets/$APP_FILE.sig")
+            echo "✅ Adding macOS platform"
+            jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$APP_FILE" \
+               '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | 
+                .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' \
+               latest.json > tmp.json && mv tmp.json latest.json
+          else
+            echo "⚠️  macOS assets not found"
+          fi
 
-          # 각 플랫폼 정보 주입
-          if [ -n "$WIN_FILE" ] && [ -n "$WIN_SIG" ]; then
-            jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$WIN_FILE" '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
-          fi
-          if [ -n "$LINUX_FILE" ] && [ -n "$LINUX_SIG" ]; then
-            jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
-          fi
-          if [ -n "$MAC_FILE" ] && [ -n "$MAC_SIG" ]; then
-            jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
-          fi
-
-          echo "=== Generated latest.json ==="
+          echo "📋 Generated latest.json:"
           cat latest.json
           
-          gh release upload $TAG_NAME latest.json --clobber
+          # latest.json을 릴리스에 업로드
+          gh release upload "$TAG_NAME" latest.json --clobber
+          echo "✅ Updater manifest uploaded successfully!"
