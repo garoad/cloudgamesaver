@@ -141,6 +141,7 @@ async fn compute_dropbox_hash(path: &PathBuf) -> String {
 
 #[tauri::command]
 fn cancel_sync(state: State<'_, AppState>) {
+    println!("[DEBUG] 동기화 취소 요청됨");
     state.cancel_sync.store(true, Ordering::SeqCst);
 }
 
@@ -243,7 +244,15 @@ async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Result<
     } else {
         let err_code = res.status().as_u16();
         let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        Err(format!("ERR_CODE:{} | 클라우드 파일 목록 조회 실패 ({}): {}", err_code, path, err_text))
+        
+        // path_not_found 에러인지 확인
+        if err_code == 409 && (err_text.contains("path_not_found") || err_text.contains("not_found")) {
+            // 폴더가 존재하지 않으면 빈 목록 반환 (업로드 시 자동으로 폴더 생성됨)
+            println!("폴더가 존재하지 않으므로 빈 목록 반환: {}", path);
+            Ok(Vec::new())
+        } else {
+            Err(format!("ERR_CODE:{} | 클라우드 파일 목록 조회 실패 ({}): {}", err_code, path, err_text))
+        }
     }
 }
 
@@ -268,7 +277,35 @@ async fn get_local_files_recursive(base_path: &std::path::Path, current_path: &s
     files
 }
 
+async fn create_dropbox_folder(client: &Client, token: &str, path: &str) -> Result<(), String> {
+    let res = client.post("https://api.dropboxapi.com/2/files/create_folder_v2")
+        .header(AUTHORIZATION, format!("Bearer {}", token))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({
+            "path": path
+        }))
+        .send().await.map_err(|e| e.to_string())?;
+    
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        let err_code = res.status().as_u16();
+        let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        Err(format!("ERR_CODE:{} | 폴더 생성 실패 ({}): {}", err_code, path, err_text))
+    }
+}
+
 async fn upload_to_dropbox(client: &Client, token: &str, local_file: PathBuf, remote_path: String) -> Result<(), String> {
+    // 폴더 경로 추출 및 생성 시도 (업로드할 파일이 있는 폴더)
+    if let Some(parent_path) = std::path::Path::new(&remote_path).parent() {
+        if let Some(parent_str) = parent_path.to_str() {
+            if !parent_str.is_empty() && parent_str != "/" {
+                // 폴더 생성 시도 (실패해도 계속 진행)
+                let _ = create_dropbox_folder(client, token, parent_str).await;
+            }
+        }
+    }
+
     let contents = tokio::fs::read(&local_file).await.map_err(|e| e.to_string())?;
     client.post("https://content.dropboxapi.com/2/files/upload")
         .header(AUTHORIZATION, format!("Bearer {}", token))
@@ -306,6 +343,11 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         
         let remote_files = match res {
             Ok(files) => files,
+            Err(e) if e.contains("ERR_CODE:409") && (e.contains("path_not_found") || e.contains("not_found")) => {
+                // 409 path_not_found 에러는 이미 list_dropbox_files에서 처리했어야 하는데 여기 도달했다면 예외 상황
+                println!("[Sync] 폴더 없음 감지, 빈 상태로 진행: {}", items[i].name);
+                Vec::new()
+            },
             Err(e) if e.contains("401") || e.contains("expired") => {
                 if let Some(ref refresh) = items[i].refresh_token {
                     println!("[Sync] 토큰 만료 감지, 갱신 시도: {}", items[i].name);
@@ -314,7 +356,11 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                             current_token = new_token.clone();
                             items[i].token = new_token.clone();
                             updated_tokens.push((i, new_token));
-                            list_dropbox_files(&client, &current_token, &items[i].cloud_path).await?
+                            // 토큰 갱신 후 다시 시도
+                            match list_dropbox_files(&client, &current_token, &items[i].cloud_path).await {
+                                Ok(files) => files,
+                                Err(retry_err) => return Err(retry_err)
+                            }
                         },
                         Err(re) => return Err(format!("토큰 갱신 실패: {}. 다시 로그인해주세요.", re))
                     }
@@ -324,6 +370,12 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
             },
             Err(e) => return Err(e)
         };
+        
+        // 취소 체크 추가
+        if state.cancel_sync.load(Ordering::SeqCst) {
+            println!("[DEBUG] 동기화 취소 감지됨");
+            return Ok(SyncResult { success: false, message: "동기화가 취소되었습니다.".to_string() });
+        }
         
         let local_dir = PathBuf::from(&items[i].local_path);
         if !local_dir.exists() { let _ = tokio::fs::create_dir_all(&local_dir).await; }
@@ -441,8 +493,12 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
     while let Some(_) = worker_tasks.next().await {}
 
     if state.cancel_sync.load(Ordering::SeqCst) {
+        println!("[DEBUG] 동기화 중단 완료, 이벤트 발송");
+        let _ = app_arc.emit("sync-complete", serde_json::json!({ "success": false, "message": "동기화가 중단되었습니다." }));
         Ok(SyncResult { success: false, message: "동기화가 중단되었습니다.".to_string() })
     } else {
+        println!("[DEBUG] 동기화 성공 완료, 이벤트 발송");
+        let _ = app_arc.emit("sync-complete", serde_json::json!({ "success": true, "message": format!("동기화 완료 ({}개의 파일 처리)", total_count) }));
         Ok(SyncResult { success: true, message: format!("동기화 완료 ({}개의 파일 처리)", total_count) })
     }
 }

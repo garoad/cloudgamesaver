@@ -222,11 +222,23 @@ export default function App() {
       setProgress(payload.progress * 100);
     });
 
+    const unSyncComplete = listen("sync-complete", (event: any) => {
+      console.log("동기화 완료 이벤트 수신:", event.payload);
+      const payload = event.payload as { success: boolean; message: string };
+      setStatus(payload.message);
+      setLoading(false);
+      setProgress(payload.success ? 100 : 0);
+      if (!payload.success) {
+        setCurrentFile("");
+      }
+    });
+
     return () => {
       clearInterval(updateInterval);
       unConnect.then(f => f());
       unTokenUpdated.then(f => f());
       unProgress.then(f => f());
+      unSyncComplete.then(f => f());
     };
   }, []);
 
@@ -319,9 +331,18 @@ export default function App() {
 
   const handleCancel = async () => {
     try {
+      console.log("동기화 취소 요청");
       await invoke("cancel_sync");
-      setStatus("취소 요청 중...");
-    } catch (e) { console.error("Cancel failed", e); }
+      setStatus("동기화가 취소되었습니다.");
+      setLoading(false);
+      setProgress(0);
+      setCurrentFile("");
+      console.log("취소 완료, 로딩창 종료");
+    } catch (e) { 
+      console.error("Cancel failed", e); 
+      setStatus("취소 요청 실패: " + e);
+      setLoading(false);
+    }
   };
 
   const syncAll = async () => {
@@ -342,19 +363,41 @@ export default function App() {
     setIsUpdating(false);
     setProgress(0);
     setCurrentFile("파일 분석 중...");
+    
+    let syncCompleted = false;
+    
     try {
       const res: any = await invoke("sync_folders", { items: validItems });
-      setStatus(res.message);
+      if (!syncCompleted) {
+        console.log("동기화 함수 완료:", res);
+        setStatus(res.message);
+        setLoading(false);
+        syncCompleted = true;
+      }
     } catch (e) {
       const errStr = String(e);
+      console.log("동기화 에러:", errStr);
       if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token") || errStr.includes("401")) {
         await handleTokenExpiration();
+      } else if (errStr.includes("취소")) {
+        setStatus("동기화가 취소되었습니다.");
       } else {
         setStatus("실패: " + e);
       }
-    } finally {
-      setLoading(false);
+      if (!syncCompleted) {
+        setLoading(false);
+        syncCompleted = true;
+      }
     }
+    
+    // 안전장치: 20초 후에도 로딩중이면 강제 종료
+    setTimeout(() => {
+      if (!syncCompleted) {
+        console.log("타임아웃으로 로딩 종료");
+        setLoading(false);
+        syncCompleted = true;
+      }
+    }, 20000);
   };
 
   return (
