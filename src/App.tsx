@@ -359,15 +359,19 @@ export default function App() {
       await message("동기화할 항목이 없거나 활성화된 게임이 없습니다.", { kind: 'warning' });
       return;
     }
+    
     setLoading(true);
     setIsUpdating(false);
     setProgress(0);
-    setCurrentFile("파일 분석 중...");
+    setStatus("동기화 준비 중...");
+    setCurrentFile("인증 확인 및 파일 분석 중...");
     
     let syncCompleted = false;
     
     try {
+      console.log("동기화 시작...");
       const res: any = await invoke("sync_folders", { items: validItems });
+      
       if (!syncCompleted) {
         console.log("동기화 함수 완료:", res);
         setStatus(res.message);
@@ -376,14 +380,18 @@ export default function App() {
       }
     } catch (e) {
       const errStr = String(e);
-      console.log("동기화 에러:", errStr);
-      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token") || errStr.includes("401")) {
+      console.error("동기화 에러 발생:", errStr);
+      
+      // 토큰 갱신 실패로 인한 401 에러인 경우에만 세션 만료 처리
+      if (errStr.includes("401") || errStr.includes("expired") || errStr.includes("토큰 갱신 실패")) {
         await handleTokenExpiration();
-      } else if (errStr.includes("취소")) {
-        setStatus("동기화가 취소되었습니다.");
+      } else if (errStr.includes("취소") || errStr.includes("중단")) {
+        setStatus("동기화가 중단되었습니다.");
       } else {
         setStatus("실패: " + e);
+        await message(`동기화 중 오류가 발생했습니다:\n${e}`, { kind: 'error' });
       }
+      
       if (!syncCompleted) {
         setLoading(false);
         syncCompleted = true;

@@ -333,10 +333,13 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
     let mut total_tasks = Vec::new();
     let mut updated_tokens = Vec::new();
     
+    let mut current_global_token: Option<String> = None;
+    
     for i in 0..items.len() {
         if !items[i].enabled { continue; }
         
-        let mut current_token = items[i].token.clone();
+        // 이전에 갱신된 토큰이 있다면 그것을 사용, 없으면 항목의 토큰 사용
+        let mut current_token = current_global_token.clone().unwrap_or_else(|| items[i].token.clone());
         let cloud_base = items[i].cloud_path.trim_end_matches('/').to_lowercase();
         
         let res = list_dropbox_files(&client, &current_token, &items[i].cloud_path).await;
@@ -344,7 +347,6 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         let remote_files = match res {
             Ok(files) => files,
             Err(e) if e.contains("ERR_CODE:409") && (e.contains("path_not_found") || e.contains("not_found")) => {
-                // 409 path_not_found 에러는 이미 list_dropbox_files에서 처리했어야 하는데 여기 도달했다면 예외 상황
                 println!("[Sync] 폴더 없음 감지, 빈 상태로 진행: {}", items[i].name);
                 Vec::new()
             },
@@ -354,8 +356,10 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                     match refresh_access_token(refresh).await {
                         Ok(new_token) => {
                             current_token = new_token.clone();
+                            current_global_token = Some(new_token.clone()); // 전역 토큰 업데이트
                             items[i].token = new_token.clone();
                             updated_tokens.push((i, new_token));
+                            
                             // 토큰 갱신 후 다시 시도
                             match list_dropbox_files(&client, &current_token, &items[i].cloud_path).await {
                                 Ok(files) => files,
@@ -370,6 +374,13 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
             },
             Err(e) => return Err(e)
         };
+        
+        // 만약 이번 루프에서 토큰이 갱신되었다면, items의 나머지 항목들도 업데이트 (다음 루프에서 사용 위해)
+        if let Some(ref latest_token) = current_global_token {
+            for item in items.iter_mut().skip(i + 1) {
+                item.token = latest_token.clone();
+            }
+        }
         
         // 취소 체크 추가
         if state.cancel_sync.load(Ordering::SeqCst) {
@@ -396,7 +407,13 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
             if rel_path.is_empty() { continue; }
             
             remote_rel_paths.insert(rel_path.clone());
+            
+            // OS별 경로 구분자 처리: Windows는 \로 변환, macOS/Linux는 / 그대로 사용
+            #[cfg(windows)]
             let local_path = local_dir.join(rel_path.replace("/", "\\"));
+            #[cfg(not(windows))]
+            let local_path = local_dir.join(&rel_path);
+            
             let remote_hash = remote_file.content_hash.clone().unwrap_or_default();
             
             if !local_path.exists() {
