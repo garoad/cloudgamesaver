@@ -49,6 +49,12 @@ CloudGameSaver는 **완전 자동화된 업데이트 시스템**을 제공합니
 
 ### 환경 구축
 - [Rust](https://www.rust-lang.org/) 및 [Node.js](https://nodejs.org/) (LTS) 설치 필수
+- **macOS 사용자**: 터미널에서 `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` 명령어로 Rust를 설치한 뒤 `source $HOME/.cargo/env`를 실행하세요.
+- **환경 변수 설정**: 프로젝트 루트에 `.env` 파일을 생성하고 드롭박스 앱 정보를 입력해야 빌드가 가능합니다.
+  ```text
+  APP_KEY=your_dropbox_app_key
+  APP_SECRET=your_dropbox_app_secret
+  ```
 
 ### 빌드 및 실행
 ```bash
@@ -117,7 +123,14 @@ cloudgamesaver/
 
 ---
 
-## 🚀 v0.1.6 주요 개선 사항 (Latest)
+## 🚀 v0.1.8 주요 개선 사항 (Latest)
+
+*   **macOS 네트워크 연결 문제 해결**: `reqwest`의 TLS 백엔드를 `rustls`로 변경하여 macOS에서 발생하던 드롭박스 API 연결 오류(Request Error)를 완전히 해결했습니다.
+*   **클라우드 경로 정규화**: 사용자가 입력한 클라우드 경로에 슬래시(/) 유무에 관계없이 드롭박스 API 표준인 절대 경로 형식으로 자동 변환하여 동기화 안정성을 높였습니다.
+*   **빌드 시스템 안정화**: `.env` 파일의 환경 변수가 빌드 시점에 앱에 올바르게 포함되도록 `build.rs`를 개선하고, macOS에서의 Rust 설치 가이드를 추가했습니다.
+*   **에러 로깅 강화**: 동기화 중 발생하는 네트워크 및 파싱 에러를 더 상세하게 출력하여 문제 진단이 용이하도록 개선했습니다.
+
+## 🚀 v0.1.7 주요 개선 사항
 
 *   **자동 폴더 생성**: 클라우드에 게임 폴더가 존재하지 않을 때 자동으로 폴더를 생성하여 신규 게임 추가 시 발생하던 "path_not_found" 에러를 완전히 해결했습니다.
 *   **로딩 UX 개선**: 동기화 완료 시 이벤트 기반 처리로 로딩창이 정확한 시점에 닫히도록 수정하여 사용자 경험을 크게 개선했습니다.

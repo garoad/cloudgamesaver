@@ -214,17 +214,17 @@ async fn list_dropbox_folders(token: String) -> Result<Vec<String>, String> {
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/json")
         .json(&serde_json::json!({"path": "", "recursive": false}))
-        .send().await.map_err(|e| e.to_string())?;
+        .send().await.map_err(|e| format!("네트워크 요청 실패: {}", e))?;
     
     if res.status().is_success() {
-        let list: DropboxListResponse = res.json().await.map_err(|e| e.to_string())?;
+        let list: DropboxListResponse = res.json().await.map_err(|e| format!("데이터 파싱 실패: {}", e))?;
         Ok(list.entries.into_iter()
             .filter(|e| e.tag == "folder")
             .map(|e| e.path_display.unwrap_or_else(|| format!("/{}", e.name)))
             .collect())
     } else {
         let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        Err(format!("목록 조회 실패: {}", err_text))
+        Err(format!("드롭박스 목록 조회 실패: {}", err_text))
     }
 }
 
@@ -340,9 +340,17 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         
         // 이전에 갱신된 토큰이 있다면 그것을 사용, 없으면 항목의 토큰 사용
         let mut current_token = current_global_token.clone().unwrap_or_else(|| items[i].token.clone());
-        let cloud_base = items[i].cloud_path.trim_end_matches('/').to_lowercase();
         
-        let res = list_dropbox_files(&client, &current_token, &items[i].cloud_path).await;
+        // 드롭박스 경로는 대소문자를 구분하지 않으며 대개 /로 시작함
+        let cloud_path_normalized = if items[i].cloud_path.starts_with('/') {
+            items[i].cloud_path.clone()
+        } else {
+            format!("/{}", items[i].cloud_path)
+        };
+        let cloud_base = cloud_path_normalized.trim_end_matches('/').to_lowercase();
+        
+        println!("[Sync] 목록 조회 시도 ({}): {}", items[i].name, cloud_path_normalized);
+        let res = list_dropbox_files(&client, &current_token, &cloud_path_normalized).await;
         
         let remote_files = match res {
             Ok(files) => files,
@@ -361,9 +369,9 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                             updated_tokens.push((i, new_token));
                             
                             // 토큰 갱신 후 다시 시도
-                            match list_dropbox_files(&client, &current_token, &items[i].cloud_path).await {
+                            match list_dropbox_files(&client, &current_token, &cloud_path_normalized).await {
                                 Ok(files) => files,
-                                Err(retry_err) => return Err(retry_err)
+                                Err(retry_err) => return Err(format!("토큰 갱신 후에도 실패: {}", retry_err))
                             }
                         },
                         Err(re) => return Err(format!("토큰 갱신 실패: {}. 다시 로그인해주세요.", re))
@@ -372,8 +380,13 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                     return Err("세션이 만료되었습니다. 다시 로그인해주세요.".to_string());
                 }
             },
-            Err(e) => return Err(e)
+            Err(e) => {
+                println!("[Sync Error] {} 목록 조회 중 중대한 오류: {}", items[i].name, e);
+                return Err(format!("클라우드 연결 오류 ({}): {}", items[i].name, e));
+            }
         };
+        
+        // ... (이후 로직에서 cloud_base 사용 부분은 동일하거나 유사하게 동작)
         
         // 만약 이번 루프에서 토큰이 갱신되었다면, items의 나머지 항목들도 업데이트 (다음 루프에서 사용 위해)
         if let Some(ref latest_token) = current_global_token {
