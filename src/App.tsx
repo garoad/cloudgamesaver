@@ -242,39 +242,56 @@ export default function App() {
     };
   }, []);
 
-  const fetchCloudFolders = async (token: string) => {
-    setLoading(true);
-    setStatus("클라우드 목록 가져오는 중...");
-    try {
-      const folders: string[] = await invoke("list_dropbox_folders", { token });
-      const rToken = localStorage.getItem("dropbox-refresh-token");
-      
-      setItems(prevItems => {
-        const existingCloudPaths = new Set(prevItems.map(i => i.cloud_path));
-        const newCloudItems: SyncItem[] = folders
-          .filter(path => !existingCloudPaths.has(path))
-          .map(path => {
-            const name = path.split('/').pop() || path;
-            return { name, local_path: "", cloud_path: path, token, refresh_token: rToken, enabled: true };
-          });
-        const updatedItems = [...prevItems, ...newCloudItems];
-        localStorage.setItem("sync-items", JSON.stringify(updatedItems));
-        if (newCloudItems.length > 0) setStatus(`${newCloudItems.length}개의 새로운 게임이 발견되었습니다.`);
-        else setStatus("이미 모든 클라우드 게임이 목록에 있습니다.");
-        return updatedItems;
-      });
-    } catch (e) {
-      const errStr = String(e);
-      if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token") || errStr.includes("401")) {
-        await handleTokenExpiration();
-      } else {
-        setStatus("목록 가져오기 실패: " + e);
-        await message(`클라우드 목록을 가져오지 못했습니다: ${e}`, { kind: 'error' });
-      }
-    } finally {
-      setLoading(false);
+const fetchCloudFolders = async (token: string, isRetry = false) => {
+  setLoading(true);
+  if (!isRetry) setStatus("클라우드 목록 가져오는 중...");
+
+  const rToken = localStorage.getItem("dropbox-refresh-token");
+
+  try {
+    const result: { folders: string[], new_token: string | null } = await invoke("list_dropbox_folders", { token, refreshToken: rToken });
+
+    // 토큰이 갱신된 경우 저장
+    if (result.new_token) {
+      console.log("[fetchCloudFolders] 토큰 갱신됨, 저장 중...");
+      setDropboxToken(result.new_token);
+      localStorage.setItem("dropbox-token", result.new_token);
+      setStatus("토큰이 갱신되었습니다. 목록을 불러오는 중...");
     }
-  };
+
+    setItems(prevItems => {
+      const existingCloudPaths = new Set(prevItems.map(i => i.cloud_path));
+      const newCloudItems: SyncItem[] = result.folders
+        .filter(path => !existingCloudPaths.has(path))
+        .map(path => {
+          const name = path.split('/').pop() || path;
+          return {
+            name,
+            local_path: "",
+            cloud_path: path,
+            token: result.new_token || token,
+            refresh_token: rToken,
+            enabled: true
+          };
+        });
+      const updatedItems = [...prevItems, ...newCloudItems];
+      localStorage.setItem("sync-items", JSON.stringify(updatedItems));
+      if (newCloudItems.length > 0) setStatus(`${newCloudItems.length}개의 새로운 게임이 발견되었습니다.`);
+      else setStatus("이미 모든 클라우드 게임이 목록에 있습니다.");
+      return updatedItems;
+    });
+  } catch (e) {
+    const errStr = String(e);
+    if (errStr.includes("expired_access_token") || errStr.includes("invalid_access_token") || errStr.includes("401")) {
+      await handleTokenExpiration();
+    } else {
+      setStatus("목록 가져오기 실패: " + e);
+      await message(`클라우드 목록을 가져오지 못했습니다: ${e}`, { kind: 'error' });
+    }
+  } finally {
+    setLoading(false);
+  }
+};
 
   const handleConnect = async () => {
     setStatus("인증 진행 중...");

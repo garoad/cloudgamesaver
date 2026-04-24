@@ -207,25 +207,67 @@ async fn exchange_code_for_token(code: String) -> Result<serde_json::Value, Stri
     }
 }
 
+#[derive(Serialize, Debug)]
+struct ListFoldersResult {
+  folders: Vec<String>,
+  new_token: Option<String>,
+}
+
 #[tauri::command]
-async fn list_dropbox_folders(token: String) -> Result<Vec<String>, String> {
-    let client = Client::new();
-    let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
-        .header(AUTHORIZATION, format!("Bearer {}", token))
-        .header(CONTENT_TYPE, "application/json")
-        .json(&serde_json::json!({"path": "", "recursive": false}))
-        .send().await.map_err(|e| format!("네트워크 요청 실패: {}", e))?;
-    
-    if res.status().is_success() {
-        let list: DropboxListResponse = res.json().await.map_err(|e| format!("데이터 파싱 실패: {}", e))?;
-        Ok(list.entries.into_iter()
-            .filter(|e| e.tag == "folder")
-            .map(|e| e.path_display.unwrap_or_else(|| format!("/{}", e.name)))
-            .collect())
+async fn list_dropbox_folders(token: String, refresh_token: Option<String>) -> Result<ListFoldersResult, String> {
+  let client = Client::new();
+  let res = client.post("https://api.dropboxapi.com/2/files/list_folder")
+    .header(AUTHORIZATION, format!("Bearer {}", token))
+    .header(CONTENT_TYPE, "application/json")
+    .json(&serde_json::json!({"path": "", "recursive": false}))
+    .send().await.map_err(|e| format!("네트워크 요청 실패: {}", e))?;
+
+  if res.status().is_success() {
+    let list: DropboxListResponse = res.json().await.map_err(|e| format!("데이터 파싱 실패: {}", e))?;
+    let folders = list.entries.into_iter()
+      .filter(|e| e.tag == "folder")
+      .map(|e| e.path_display.unwrap_or_else(|| format!("/{}", e.name)))
+      .collect();
+    Ok(ListFoldersResult { folders, new_token: None })
+  } else {
+    let status_code = res.status().as_u16();
+    let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+
+    // 토큰 만료 에러인 경우 갱신 시도
+    if err_text.contains("expired_access_token") || err_text.contains("invalid_access_token") || status_code == 401 {
+      if let Some(ref r_token) = refresh_token {
+        println!("[ListFolders] 토큰 만료 감지, 갱신 시도");
+        match refresh_access_token(r_token).await {
+          Ok(new_token) => {
+            // 새 토큰으로 다시 시도
+            let retry_res = client.post("https://api.dropboxapi.com/2/files/list_folder")
+              .header(AUTHORIZATION, format!("Bearer {}", new_token))
+              .header(CONTENT_TYPE, "application/json")
+              .json(&serde_json::json!({"path": "", "recursive": false}))
+              .send().await.map_err(|e| format!("재시도 네트워크 요청 실패: {}", e))?;
+
+            if retry_res.status().is_success() {
+              let list: DropboxListResponse = retry_res.json().await.map_err(|e| format!("재시도 데이터 파싱 실패: {}", e))?;
+              let folders = list.entries.into_iter()
+                .filter(|e| e.tag == "folder")
+                .map(|e| e.path_display.unwrap_or_else(|| format!("/{}", e.name)))
+                .collect();
+              println!("[ListFolders] 토큰 갱신 성공, 목록 조회 완료");
+              Ok(ListFoldersResult { folders, new_token: Some(new_token) })
+            } else {
+              let retry_err = retry_res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+              Err(format!("토큰 갱신 후에도 실패: {}", retry_err))
+            }
+          },
+          Err(e) => Err(format!("토큰 갱신 실패: {}. 다시 로그인해주세요.", e))
+        }
+      } else {
+        Err(format!("expired_access_token|{}", err_text))
+      }
     } else {
-        let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-        Err(format!("드롭박스 목록 조회 실패: {}", err_text))
+      Err(format!("드롭박스 목록 조회 실패: {}", err_text))
     }
+  }
 }
 
 async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Result<Vec<DropboxEntry>, String> {

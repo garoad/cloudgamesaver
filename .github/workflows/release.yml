@@ -109,8 +109,8 @@ jobs:
           includeRelease: true
           includeUpdaterJson: false
 
-      # Windows Portable 실행파일 추출 및 업로드
-      - name: Extract and Upload Windows Portable
+      # Windows NSIS 설치 프로그램 및 서명 파일 추출 및 업로드 (자동 업데이트용)
+      - name: Extract and Upload Windows NSIS Installer
         if: matrix.platform == 'windows-latest'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -118,44 +118,59 @@ jobs:
           $VERSION = "${{ steps.version.outputs.version }}"
           $TAG_NAME = "v$VERSION"
           
-          # 빌드된 실행파일 경로
-          $EXE_PATH = "src-tauri/target/x86_64-pc-windows-msvc/release/CloudGameSaver.exe"
+          # NSIS 설치 프로그램 찾기 (자동 업데이트용으로 서명됨)
+          $NSIS_PATTERN = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*setup.exe"
+          $SetupFiles = Get-ChildItem -Path $NSIS_PATTERN -ErrorAction SilentlyContinue
           
-          if (Test-Path $EXE_PATH) {
-            Write-Host "✅ Found Windows executable: $EXE_PATH"
+          if ($SetupFiles) {
+            $SetupFile = $SetupFiles[0]
+            Write-Host "✅ Found Windows NSIS installer: $($SetupFile.FullName)"
             
             # 파일 크기 확인
-            $FileSize = (Get-Item $EXE_PATH).Length / 1MB
+            $FileSize = (Get-Item $SetupFile.FullName).Length / 1MB
             Write-Host "📦 File size: $([math]::Round($FileSize, 2)) MB"
             
-            # CloudGameSaver.exe로 복사
-            Copy-Item $EXE_PATH "CloudGameSaver.exe"
+            # CloudGameSaver.exe로 복사 (자동 업데이트용 파일명)
+            Copy-Item $SetupFile.FullName "CloudGameSaver.exe"
             
             # GitHub Release에 업로드
             gh release upload $TAG_NAME "CloudGameSaver.exe" --clobber
-            Write-Host "✅ Successfully uploaded CloudGameSaver.exe"
+            Write-Host "✅ Successfully uploaded CloudGameSaver.exe (NSIS installer for auto-updater)"
             
-            # 서명 파일 찾기 및 업로드
-            $SIG_PATTERN = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig"
-            $SigFiles = Get-ChildItem -Path $SIG_PATTERN -ErrorAction SilentlyContinue
+            # 서명 파일 찾기 및 업로드 (같은 이름의 .sig 파일)
+            $SigFile = "$($SetupFile.FullName).sig"
             
-            if ($SigFiles) {
-              $SigFile = $SigFiles[0]
-              Copy-Item $SigFile.FullName "CloudGameSaver.exe.sig"
+            if (Test-Path $SigFile) {
+              Copy-Item $SigFile "CloudGameSaver.exe.sig"
               gh release upload $TAG_NAME "CloudGameSaver.exe.sig" --clobber
-              Write-Host "✅ Successfully uploaded signature file"
+              Write-Host "✅ Successfully uploaded signature file for auto-updater"
             } else {
-              Write-Host "⚠️ Warning: Signature file not found"
-              # 더미 서명 파일 생성
-              "dummy_signature_for_updater" | Out-File "CloudGameSaver.exe.sig" -Encoding ASCII
-              gh release upload $TAG_NAME "CloudGameSaver.exe.sig" --clobber
-              Write-Host "📝 Uploaded placeholder signature"
+              Write-Host "❌ Error: Signature file not found at: $SigFile"
+              Write-Host "📂 Looking for alternative signature files..."
+              $AltSigPattern = "src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.sig"
+              $AltSigFiles = Get-ChildItem -Path $AltSigPattern -ErrorAction SilentlyContinue
+              if ($AltSigFiles) {
+                Copy-Item $AltSigFiles[0].FullName "CloudGameSaver.exe.sig"
+                gh release upload $TAG_NAME "CloudGameSaver.exe.sig" --clobber
+                Write-Host "✅ Successfully uploaded alternative signature file"
+              } else {
+                Write-Host "❌ No signature files found, auto-update will fail"
+                exit 1
+              }
             }
           } else {
-            Write-Host "❌ Windows executable not found at: $EXE_PATH"
+            Write-Host "❌ Windows NSIS installer not found"
             Write-Host "📂 Available files:"
             Get-ChildItem "src-tauri/target" -Recurse -Name "*.exe" | Out-Host
             exit 1
+          }
+          
+          # Portable .exe도 별도로 업로드 (수동 다운로드용)
+          $PORTABLE_EXE = "src-tauri/target/x86_64-pc-windows-msvc/release/CloudGameSaver.exe"
+          if (Test-Path $PORTABLE_EXE) {
+            Write-Host "📦 Also uploading portable executable for manual download..."
+            gh release upload $TAG_NAME "$PORTABLE_EXE" --clobber --repo ${{ github.repository }}
+            Write-Host "✅ Portable executable uploaded as extra asset"
           }
 
       # macOS App 처리 및 서명 파일 추출
@@ -272,68 +287,53 @@ jobs:
         run: |
           VERSION="${{ needs.build-and-release.outputs.version }}"
           TAG_NAME="v$VERSION"
-          
+          REPO="${{ github.repository }}"
+
           echo "🔄 Generating updater manifest for $TAG_NAME..."
-          
+
           # 잠시 대기 (릴리스 완료 확인)
           sleep 60
-          
-          # 릴리스 에셋 다운로드 
+
+          # 릴리스 에셋 다운로드
           mkdir -p assets
           gh release download "$TAG_NAME" --dir assets || true
-          
+
           echo "📦 Downloaded assets:"
           ls -la assets/ || echo "No assets found"
-          
+
           # latest.json 기본 구조 생성
-          cat > latest.json << EOF
+          PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          cat > latest.json << JSONEOF
           {
             "version": "$VERSION",
             "notes": "CloudGameSaver $VERSION 업데이트가 준비되었습니다.\\n\\n새로운 기능과 개선사항을 확인해보세요!",
-            "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "pub_date": "$PUB_DATE",
             "platforms": {}
           }
-          EOF
+          JSONEOF
 
-          BASE_URL="https://github.com/${{ github.repository }}/releases/download/$TAG_NAME"
-          
-          # Windows 플랫폼 처리 (CloudGameSaver.exe 우선)
-          if [[ -f "assets/CloudGameSaver.exe" ]]; then
-            echo "✅ Found Windows executable: CloudGameSaver.exe"
-            
-            # 서명 파일 확인
-            if [[ -f "assets/CloudGameSaver.exe.sig" ]]; then
-              WIN_SIG=$(cat "assets/CloudGameSaver.exe.sig")
-              echo "✅ Found Windows signature"
-            else
-              echo "⚠️ Windows signature not found, creating placeholder"
-              WIN_SIG="dummy_signature_for_updater"
-            fi
-            
+          BASE_URL="https://github.com/$REPO/releases/download/$TAG_NAME"
+
+          # Windows 플랫폼 처리 (CloudGameSaver.exe는 NSIS 설치 프로그램)
+          if [[ -f "assets/CloudGameSaver.exe" && -f "assets/CloudGameSaver.exe.sig" ]]; then
+            echo "✅ Found Windows NSIS installer with signature: CloudGameSaver.exe"
+            WIN_SIG=$(cat "assets/CloudGameSaver.exe.sig")
+            echo "✅ Found Windows signature (first 100 chars): ${WIN_SIG:0:100}..."
+
             jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/CloudGameSaver.exe" \
-               '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' \
-               latest.json > tmp.json && mv tmp.json latest.json
-            echo "✅ Added Windows platform to manifest"
+              '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' \
+              latest.json > tmp.json && mv tmp.json latest.json
+            echo "✅ Added Windows platform to manifest with valid signature"
           else
-            echo "⚠️ CloudGameSaver.exe not found, checking NSIS installer..."
-            
-            # NSIS 설치파일로 대체
-            NSIS_FILE=$(ls assets/*setup*.exe 2>/dev/null | head -1 | xargs basename || echo "")
-            if [[ -n "$NSIS_FILE" && -f "assets/$NSIS_FILE.sig" ]]; then
-              WIN_SIG=$(cat "assets/$NSIS_FILE.sig")
-              jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/$NSIS_FILE" \
-                 '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' \
-                 latest.json > tmp.json && mv tmp.json latest.json
-              echo "✅ Added Windows NSIS installer to manifest"
-            else
-              echo "❌ No suitable Windows files found"
-            fi
+            echo "❌ Error: CloudGameSaver.exe or its signature not found"
+            echo "📂 Available assets:"
+            ls -la assets/
+            exit 1
           fi
           
-          # Linux 플랫폼 처리  
+          # Linux 플랫폼 처리
           if [[ -f "assets/CloudGameSaver.AppImage" ]]; then
             echo "✅ Found Linux AppImage: CloudGameSaver.AppImage"
-            
             if [[ -f "assets/CloudGameSaver.AppImage.sig" ]]; then
               LINUX_SIG=$(cat "assets/CloudGameSaver.AppImage.sig")
               echo "✅ Found Linux signature"
@@ -341,30 +341,27 @@ jobs:
               echo "⚠️ Linux signature not found, creating placeholder"
               LINUX_SIG="dummy_signature_for_linux_updater"
             fi
-            
             jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/CloudGameSaver.AppImage" \
-               '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
-               latest.json > tmp.json && mv tmp.json latest.json
+              '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
+              latest.json > tmp.json && mv tmp.json latest.json
             echo "✅ Added Linux platform to manifest"
           else
             echo "⚠️ CloudGameSaver.AppImage not found, searching for other AppImage files..."
-            
             LINUX_FILE=$(ls assets/*.AppImage 2>/dev/null | head -1 | xargs basename || echo "")
             if [[ -n "$LINUX_FILE" && -f "assets/$LINUX_FILE.sig" ]]; then
               LINUX_SIG=$(cat "assets/$LINUX_FILE.sig")
               jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" \
-                 '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
-                 latest.json > tmp.json && mv tmp.json latest.json
+                '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
+                latest.json > tmp.json && mv tmp.json latest.json
               echo "✅ Added Linux platform with file: $LINUX_FILE"
             else
               echo "❌ No suitable Linux AppImage found"
             fi
           fi
-          
+
           # macOS 플랫폼 처리
           if [[ -f "assets/CloudGameSaver.app.tar.gz" ]]; then
             echo "✅ Found macOS App bundle: CloudGameSaver.app.tar.gz"
-            
             if [[ -f "assets/CloudGameSaver.app.tar.gz.sig" ]]; then
               MAC_SIG=$(cat "assets/CloudGameSaver.app.tar.gz.sig")
               echo "✅ Found macOS signature"
@@ -372,22 +369,16 @@ jobs:
               echo "⚠️ macOS signature not found, creating placeholder"
               MAC_SIG="dummy_signature_for_macos_updater"
             fi
-            
             jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/CloudGameSaver.app.tar.gz" \
-               '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | 
-                .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' \
-               latest.json > tmp.json && mv tmp.json latest.json
+              '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' \
+              latest.json > tmp.json && mv tmp.json latest.json
             echo "✅ Added macOS platform to manifest"
           else
             echo "⚠️ CloudGameSaver.app.tar.gz not found, searching for other tar.gz files..."
-            
             MAC_FILE=$(ls assets/*.app.tar.gz 2>/dev/null | head -1 | xargs basename || echo "")
             if [[ -n "$MAC_FILE" && -f "assets/$MAC_FILE.sig" ]]; then
               MAC_SIG=$(cat "assets/$MAC_FILE.sig")
-              jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" \
-                 '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | 
-                  .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' \
-                 latest.json > tmp.json && mv tmp.json latest.json
+              jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/$MAC_FILE" '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' latest.json > tmp.json && mv tmp.json latest.json
               echo "✅ Added macOS platform with file: $MAC_FILE"
             else
               echo "❌ No suitable macOS .app.tar.gz found"
@@ -396,7 +387,7 @@ jobs:
 
           echo "📋 Generated latest.json:"
           cat latest.json
-          
+
           # latest.json을 릴리스에 업로드
           gh release upload "$TAG_NAME" latest.json --clobber
           echo "✅ Updater manifest uploaded successfully!"
