@@ -303,6 +303,8 @@ async fn get_local_files_recursive(base_path: &std::path::Path, current_path: &s
     if let Ok(mut entries) = tokio::fs::read_dir(current_path).await {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if file_name.eq_ignore_ascii_case(".DS_Store") { continue; }
             if path.is_dir() {
                 let sub_files = Box::pin(get_local_files_recursive(base_path, &path)).await;
                 files.extend(sub_files);
@@ -310,7 +312,10 @@ async fn get_local_files_recursive(base_path: &std::path::Path, current_path: &s
                 if let Ok(rel_path) = path.strip_prefix(base_path) {
                     if let Some(rel_str) = rel_path.to_str() {
                         // 윈도우 경로 구분자를 슬래시로 통일
-                        files.push((rel_str.replace("\\", "/"), path));
+                        let normalized = rel_str.replace("\\", "/");
+                        if !normalized.to_lowercase().ends_with(".ds_store") {
+                            files.push((normalized, path));
+                        }
                     }
                 }
             }
@@ -448,7 +453,9 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         
         let mut remote_rel_paths = HashSet::new();
         for remote_file in remote_files {
+            if remote_file.name.eq_ignore_ascii_case(".DS_Store") { continue; }
             let remote_path = remote_file.path_display.clone().unwrap_or_default();
+            if remote_path.to_lowercase().ends_with(".ds_store") { continue; }
             let remote_path_lower = remote_path.to_lowercase();
             
             // cloud_path 기준 상대 경로 추출
@@ -473,6 +480,7 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
             
             if !local_path.exists() {
                 println!("[Sync] 신규 다운로드 감지: {}", rel_path);
+                let _ = app.emit("sync-log", format!("[다운로드 감지] '{}' (클라우드 신규 파일)", rel_path));
                 total_tasks.push(("down", current_token.clone(), remote_path, local_path, rel_path));
             } else {
                 let local_hash = compute_dropbox_hash(&local_path).await;
@@ -487,14 +495,17 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                             let local_modified: DateTime<Utc> = modified.into();
                             println!("[Sync] 해시 불일치 ({}): 로컬={}, 서버={}", rel_path, local_modified, remote_modified);
                             if remote_modified > local_modified {
+                                let _ = app.emit("sync-log", format!("[다운로드 감지] '{}' (클라우드 데이터가 최신)", rel_path));
                                 total_tasks.push(("down", current_token.clone(), remote_path, local_path, rel_path));
                             } else {
+                                let _ = app.emit("sync-log", format!("[업로드 감지] '{}' (로컬 데이터가 최신)", rel_path));
                                 total_tasks.push(("up", current_token.clone(), remote_path, local_path, rel_path));
                             }
                         }
                     }
                 } else {
                     println!("[Sync] 파일 일치 (해시 동일): {}", rel_path);
+                    let _ = app.emit("sync-log", format!("[동일 생략] '{}' (동일 해시)", rel_path));
                 }
             }
         }
@@ -545,8 +556,12 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                 download_from_dropbox(&client, &token, remote_path, local_path).await
             };
             
-            if let Err(e) = res {
+            if let Err(ref e) = res {
                 println!("[Sync Error] {} 처리 중 오류: {}", file_name, e);
+                let _ = app.emit("sync-log", format!("[처리 오류] '{}': {}", file_name, e));
+            } else {
+                let act_label = if action == "up" { "업로드 완료" } else { "다운로드 완료" };
+                let _ = app.emit("sync-log", format!("[{}] '{}'", act_label, file_name));
             }
             
             {
@@ -575,6 +590,62 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
     }
 }
 
+#[tauri::command]
+async fn delete_dropbox_folder(path: String, token: String, refresh_token: Option<String>) -> Result<Option<String>, String> {
+    let client = Client::new();
+    let delete_url = "https://api.dropboxapi.com/2/files/delete_v2";
+    
+    let formatted_path = if path.starts_with('/') { path.clone() } else { format!("/{}", path) };
+
+    println!("[Dropbox Delete] 폴더 삭제 요청: {}", formatted_path);
+
+    let res = client.post(delete_url)
+        .header(AUTHORIZATION, format!("Bearer {}", token))
+        .header(CONTENT_TYPE, "application/json")
+        .json(&serde_json::json!({ "path": formatted_path }))
+        .send().await.map_err(|e| format!("네트워크 요청 실패: {}", e))?;
+
+    if res.status().is_success() {
+        println!("[Dropbox Delete] 폴더 삭제 성공: {}", formatted_path);
+        Ok(None)
+    } else {
+        let status = res.status();
+        let err_text = res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+        
+        if status.as_u16() == 401 || err_text.contains("expired_access_token") || err_text.contains("invalid_access_token") {
+            if let Some(ref r_token) = refresh_token {
+                println!("[Dropbox Delete] 토큰 만료 감지, 갱신 후 재시도: {}", formatted_path);
+                match refresh_access_token(r_token).await {
+                    Ok(new_token) => {
+                        let retry_res = client.post(delete_url)
+                            .header(AUTHORIZATION, format!("Bearer {}", new_token))
+                            .header(CONTENT_TYPE, "application/json")
+                            .json(&serde_json::json!({ "path": formatted_path }))
+                            .send().await.map_err(|e| format!("재시도 네트워크 요청 실패: {}", e))?;
+                        
+                        if retry_res.status().is_success() {
+                            println!("[Dropbox Delete] 토큰 갱신 후 삭제 성공: {}", formatted_path);
+                            Ok(Some(new_token))
+                        } else {
+                            let retry_status = retry_res.status();
+                            let retry_err = retry_res.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+                            Err(format!("드롭박스 삭제 실패 (HTTP {}): {}", retry_status, retry_err))
+                        }
+                    },
+                    Err(e) => Err(format!("토큰 갱신 실패: {}", e))
+                }
+            } else {
+                Err("인증 토큰이 만료되었습니다. 다시 연결해주세요.".to_string())
+            }
+        } else if status.as_u16() == 409 && (err_text.contains("path_lookup/not_found") || err_text.contains("not_found")) {
+            println!("[Dropbox Delete] 폴더가 이미 존재하지 않음: {}", formatted_path);
+            Ok(None)
+        } else {
+            Err(format!("드롭박스 폴더 삭제 실패 (HTTP {}): {}", status, err_text))
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -598,7 +669,8 @@ pub fn run() {
             open_auth_url, 
             pick_folder_dialog, 
             exchange_code_for_token, 
-            list_dropbox_folders
+            list_dropbox_folders,
+            delete_dropbox_folder
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
