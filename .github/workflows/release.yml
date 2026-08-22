@@ -304,14 +304,11 @@ jobs:
 
           # latest.json 기본 구조 생성
           PUB_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-          cat > latest.json << JSONEOF
-          {
-            "version": "$VERSION",
-            "notes": "CloudGameSaver $VERSION 업데이트가 준비되었습니다.\\n\\n새로운 기능과 개선사항을 확인해보세요!",
-            "pub_date": "$PUB_DATE",
-            "platforms": {}
-          }
-JSONEOF
+          jq -n \
+            --arg version "$VERSION" \
+            --arg notes "CloudGameSaver $VERSION 업데이트가 준비되었습니다.\n\n새로운 기능과 개선사항을 확인해보세요!" \
+            --arg pub_date "$PUB_DATE" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, platforms: {}}' > latest.json
 
           BASE_URL="https://github.com/$REPO/releases/download/$TAG_NAME"
 
