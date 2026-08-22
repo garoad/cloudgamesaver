@@ -1,7 +1,7 @@
 [package]
 name = "CloudGameSaver"
-version = "0.2.0"
-description = "A Tauri App"
+version = "0.2.1"
+description = "CloudGameSaver - Cross-platform Game Save Synchronization Tool"
 authors = ["you"]
 edition = "2021"
 

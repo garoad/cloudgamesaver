@@ -96,7 +96,7 @@ jobs:
             자동으로 빌드된 최신 릴리스입니다.
             
             ### 📥 다운로드
-            - Windows: CloudGameSaver.exe (Portable)
+            - Windows: CloudGameSaver.exe (설치 및 자동 업데이트용) / CloudGameSaver-portable.exe (포터블 무설치용)
             - Linux: CloudGameSaver.AppImage  
             - macOS: CloudGameSaver.app.tar.gz (자동 업데이트용) / CloudGameSaver.dmg (설치용)
             
@@ -165,12 +165,13 @@ jobs:
             exit 1
           }
           
-          # Portable .exe도 별도로 업로드 (수동 다운로드용)
+          # Portable .exe도 별도로 업로드 (수동 다운로드용, setup.exe를 덮어쓰지 않도록 이름 분리)
           $PORTABLE_EXE = "src-tauri/target/x86_64-pc-windows-msvc/release/CloudGameSaver.exe"
           if (Test-Path $PORTABLE_EXE) {
             Write-Host "📦 Also uploading portable executable for manual download..."
-            gh release upload $TAG_NAME "$PORTABLE_EXE" --clobber --repo ${{ github.repository }}
-            Write-Host "✅ Portable executable uploaded as extra asset"
+            Copy-Item $PORTABLE_EXE "CloudGameSaver-portable.exe"
+            gh release upload $TAG_NAME "CloudGameSaver-portable.exe" --clobber --repo ${{ github.repository }}
+            Write-Host "✅ Portable executable uploaded as CloudGameSaver-portable.exe"
           }
 
       # macOS App 처리 및 서명 파일 추출
@@ -310,7 +311,7 @@ jobs:
             "pub_date": "$PUB_DATE",
             "platforms": {}
           }
-          JSONEOF
+JSONEOF
 
           BASE_URL="https://github.com/$REPO/releases/download/$TAG_NAME"
 
@@ -320,9 +321,7 @@ jobs:
             WIN_SIG=$(cat "assets/CloudGameSaver.exe.sig")
             echo "✅ Found Windows signature (first 100 chars): ${WIN_SIG:0:100}..."
 
-            jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/CloudGameSaver.exe" \
-              '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}' \
-              latest.json > tmp.json && mv tmp.json latest.json
+            jq --arg sig "$WIN_SIG" --arg url "$BASE_URL/CloudGameSaver.exe"               '.platforms["windows-x86_64"] = {"signature": $sig, "url": $url}'               latest.json > tmp.json && mv tmp.json latest.json
             echo "✅ Added Windows platform to manifest with valid signature"
           else
             echo "❌ Error: CloudGameSaver.exe or its signature not found"
@@ -341,18 +340,14 @@ jobs:
               echo "⚠️ Linux signature not found, creating placeholder"
               LINUX_SIG="dummy_signature_for_linux_updater"
             fi
-            jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/CloudGameSaver.AppImage" \
-              '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
-              latest.json > tmp.json && mv tmp.json latest.json
+            jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/CloudGameSaver.AppImage"               '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}'               latest.json > tmp.json && mv tmp.json latest.json
             echo "✅ Added Linux platform to manifest"
           else
             echo "⚠️ CloudGameSaver.AppImage not found, searching for other AppImage files..."
             LINUX_FILE=$(ls assets/*.AppImage 2>/dev/null | head -1 | xargs basename || echo "")
             if [[ -n "$LINUX_FILE" && -f "assets/$LINUX_FILE.sig" ]]; then
               LINUX_SIG=$(cat "assets/$LINUX_FILE.sig")
-              jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE" \
-                '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}' \
-                latest.json > tmp.json && mv tmp.json latest.json
+              jq --arg sig "$LINUX_SIG" --arg url "$BASE_URL/$LINUX_FILE"                 '.platforms["linux-x86_64"] = {"signature": $sig, "url": $url}'                 latest.json > tmp.json && mv tmp.json latest.json
               echo "✅ Added Linux platform with file: $LINUX_FILE"
             else
               echo "❌ No suitable Linux AppImage found"
@@ -369,9 +364,7 @@ jobs:
               echo "⚠️ macOS signature not found, creating placeholder"
               MAC_SIG="dummy_signature_for_macos_updater"
             fi
-            jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/CloudGameSaver.app.tar.gz" \
-              '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}' \
-              latest.json > tmp.json && mv tmp.json latest.json
+            jq --arg sig "$MAC_SIG" --arg url "$BASE_URL/CloudGameSaver.app.tar.gz"               '.platforms["darwin-aarch64"] = {"signature": $sig, "url": $url} | .platforms["darwin-x86_64"] = {"signature": $sig, "url": $url}'               latest.json > tmp.json && mv tmp.json latest.json
             echo "✅ Added macOS platform to manifest"
           else
             echo "⚠️ CloudGameSaver.app.tar.gz not found, searching for other tar.gz files..."

@@ -575,7 +575,7 @@ export default function App() {
         <div className="brand-header">
           <div className="brand-title-row">
             <h1>CloudGameSaver</h1>
-            <span className="version-badge">v0.2.0</span>
+            <span className="version-badge">v0.2.1</span>
           </div>
           <p className="subtitle">드롭박스 세이브파일 완벽 동기화</p>
         </div>
@@ -669,7 +669,7 @@ export default function App() {
         </section>
 
         {/* 게임 리스트 영역 */}
-        <section className="card-section flex-1 list-section-container">
+        <section className="card-section list-section-container">
           <div className="card-header list-header">
             <div>
               <h3>🎮 게임 동기화 관리 목록</h3>
