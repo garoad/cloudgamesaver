@@ -4,11 +4,13 @@ version = 4
 
 [[package]]
 name = "CloudGameSaver"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dotenvy",
  "futures",
+ "getrandom 0.2.17",
  "hex",
  "rayon",
  "reqwest 0.12.28",

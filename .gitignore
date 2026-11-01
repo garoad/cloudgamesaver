@@ -11,8 +11,19 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+artifacts/
 src-tauri/target
-src-tauri/gen
+src-tauri/gen/schemas/
+
+# Android build outputs and machine-specific configuration
+**/.gradle/
+**/.kotlin/
+src-tauri/gen/android/local.properties
+src-tauri/gen/android/app/build/
+src-tauri/gen/android/build/
+*.keystore
+*.jks
+.android-signing/
 
 # OS related
 .DS_Store

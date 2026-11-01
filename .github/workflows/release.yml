@@ -2,11 +2,7 @@ name: "Auto Release & Update"
 
 on:
   push:
-    branches: [main]
-    paths-ignore:
-      - "README.md"
-      - ".gitignore"
-      - "LICENSE"
+    tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
@@ -46,6 +42,10 @@ jobs:
         shell: bash
         run: |
           VERSION=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$VERSION" ]]; then
+            echo "::error::Release tag must match package.json version: v$VERSION"
+            exit 1
+          fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Building version: $VERSION"
 
@@ -99,9 +99,10 @@ jobs:
             - Windows: CloudGameSaver.exe (설치 및 자동 업데이트용) / CloudGameSaver-portable.exe (포터블 무설치용)
             - Linux: CloudGameSaver.AppImage  
             - macOS: CloudGameSaver.app.tar.gz (자동 업데이트용) / CloudGameSaver.dmg (설치용)
+            - Android: CloudGameSaver-android-arm64.apk (Android 7.0 이상, ARM64)
             
             ### 🔄 자동 업데이트
-            이전 버전 사용자는 앱 내에서 자동 업데이트가 가능합니다.
+            Windows/macOS/Linux는 앱 내에서 자동 업데이트가 가능합니다. Android는 새 APK를 설치해 업데이트하세요.
           releaseDraft: true
           prerelease: false
           args: "--target ${{ matrix.target }}"
@@ -268,9 +269,73 @@ jobs:
             exit 1
           fi
 
-  # 업데이터 매니페스트 생성
-  generate-updater:
+  build-android-release:
     needs: build-and-release
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore Android release signing key
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for android_secret in APP_KEY ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [ -z "${!android_secret}" ]; then
+              echo "::error::Missing repository secret: $android_secret"
+              exit 1
+            fi
+          done
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/cloudgamesaver-release.jks"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "lts/*"
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;27.2.12479018"
+      - run: npm ci
+      - name: Build and sign ARM64 release APK
+        env:
+          APP_KEY: ${{ secrets.APP_KEY }}
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/cloudgamesaver-release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: npm run android:package
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CloudGameSaver-android-arm64-release
+          path: artifacts/android/CloudGameSaver-android-arm64.apk
+          if-no-files-found: error
+      - name: Attach APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: v${{ needs.build-and-release.outputs.version }}
+        run: gh release upload "$RELEASE_TAG" artifacts/android/CloudGameSaver-android-arm64.apk --clobber --repo "$GITHUB_REPOSITORY"
+      - name: Remove temporary signing key
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/cloudgamesaver-release.jks"
+
+  # 모든 플랫폼의 릴리스 첨부가 완료된 뒤 업데이터 매니페스트 생성
+  generate-updater:
+    needs: [build-and-release, build-android-release]
     runs-on: ubuntu-latest
     permissions:
       contents: write

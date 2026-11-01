@@ -1,13 +1,19 @@
 {
   "name": "cloudgamesaver",
   "private": true,
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "android:setup": "bash scripts/setup_android.sh",
+    "android:init": "bash scripts/android.sh init",
+    "android:dev": "bash scripts/android.sh dev",
+    "android:build": "bash scripts/android.sh build --apk --target aarch64",
+    "android:test": "bash scripts/test_android.sh",
+    "android:package": "bash scripts/package_android.sh"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

@@ -1,13 +1,17 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use std::collections::HashSet;
+#[cfg(desktop)]
 use std::thread;
+#[cfg(desktop)]
 use tiny_http::{Response, Server};
 use url::Url;
-use tauri::{AppHandle, Runtime, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
+#[cfg(desktop)]
+use tauri::{Manager, Runtime};
+#[cfg(desktop)]
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use std::sync::{Arc, Mutex};
@@ -15,15 +19,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use sha2::{Sha256, Digest};
 use futures::stream::{StreamExt, FuturesUnordered};
 
+mod storage;
+use storage::LocalFile;
+#[cfg(target_os = "android")]
+mod android_storage;
+
 // 앱 전역 상태: 취소 플래그 관리
 pub struct AppState {
     pub cancel_sync: AtomicBool,
+    #[cfg(target_os = "android")]
+    oauth_verifier: Mutex<Option<String>>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
         Self {
             cancel_sync: AtomicBool::new(false),
+            #[cfg(target_os = "android")]
+            oauth_verifier: Mutex::new(None),
         }
     }
 }
@@ -32,6 +45,7 @@ fn get_app_key() -> String {
     option_env!("APP_KEY").unwrap_or("").to_string()
 }
 
+#[cfg(desktop)]
 fn get_app_secret() -> String {
     option_env!("APP_SECRET").unwrap_or("").to_string()
 }
@@ -81,13 +95,16 @@ struct TokenResponse {
 
 async fn refresh_access_token(refresh_token: &str) -> Result<String, String> {
     let client = Client::new();
+    #[allow(unused_mut)]
+    let mut form = vec![
+        ("grant_type", "refresh_token".to_owned()),
+        ("refresh_token", refresh_token.to_owned()),
+        ("client_id", get_app_key()),
+    ];
+    #[cfg(desktop)]
+    form.push(("client_secret", get_app_secret()));
     let res = client.post("https://api.dropboxapi.com/oauth2/token")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", get_app_key().as_str()),
-            ("client_secret", get_app_secret().as_str()),
-        ])
+        .form(&form)
         .send().await.map_err(|e| e.to_string())?;
 
     if res.status().is_success() {
@@ -99,11 +116,8 @@ async fn refresh_access_token(refresh_token: &str) -> Result<String, String> {
     }
 }
 
-async fn compute_dropbox_hash(path: &PathBuf) -> String {
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return String::new(),
-    };
+async fn compute_dropbox_hash(app: &AppHandle, path: &LocalFile) -> Result<String, String> {
+    let mut file = path.open_read(app).await?;
 
     let mut overall_hasher = Sha256::new();
     let mut has_any_block = false;
@@ -117,7 +131,7 @@ async fn compute_dropbox_hash(path: &PathBuf) -> String {
             match file.read(&mut buffer[total_read..]).await {
                 Ok(0) => break,
                 Ok(n) => total_read += n,
-                Err(_) => break,
+                Err(error) => return Err(error.to_string()),
             }
         }
 
@@ -133,10 +147,10 @@ async fn compute_dropbox_hash(path: &PathBuf) -> String {
 
     if !has_any_block {
         let empty_block_hasher = Sha256::new();
-        return hex::encode(empty_block_hasher.finalize());
+        return Ok(hex::encode(empty_block_hasher.finalize()));
     }
 
-    hex::encode(overall_hasher.finalize())
+    Ok(hex::encode(overall_hasher.finalize()))
 }
 
 #[tauri::command]
@@ -145,6 +159,7 @@ fn cancel_sync(state: State<'_, AppState>) {
     state.cancel_sync.store(true, Ordering::SeqCst);
 }
 
+#[cfg(desktop)]
 #[tauri::command]
 fn open_auth_url(app: AppHandle) -> Result<(), String> {
     let redirect_uri = "http://localhost:8421/callback";
@@ -172,31 +187,81 @@ fn open_auth_url(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+#[tauri::command]
+fn open_auth_url(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let app_key = get_app_key();
+    if app_key.is_empty() { return Err("빌드 환경에 Dropbox APP_KEY를 설정해주세요.".to_owned()); }
+    let mut random = [0u8; 32];
+    getrandom::getrandom(&mut random).map_err(|e| e.to_string())?;
+    let verifier = URL_SAFE_NO_PAD.encode(random);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    let mut url = Url::parse("https://www.dropbox.com/oauth2/authorize").map_err(|e| e.to_string())?;
+    // Dropbox displays a code when redirect_uri is omitted. This works without
+    // registering a new redirect URI and survives switching to a browser.
+    url.query_pairs_mut()
+        .append_pair("client_id", &app_key)
+        .append_pair("response_type", "code")
+        .append_pair("token_access_type", "offline")
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("code_challenge", &challenge);
+    *state.oauth_verifier.lock().map_err(|e| e.to_string())? = Some(verifier);
+    app.opener().open_url(url.to_string(), None::<String>).map_err(|e| e.to_string())
+}
+
+#[cfg(desktop)]
 #[tauri::command]
 async fn pick_folder_dialog<R: Runtime>(app: AppHandle<R>) -> Result<Option<String>, String> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog().file().pick_folder(move |folder| {
         let path = folder.map(|f| f.to_string());
         tx.send(path).ok();
     });
-    Ok(rx.recv().map_err(|e| e.to_string())?)
+    rx.await.map_err(|e| e.to_string())
+}
+
+#[cfg(target_os = "android")]
+#[tauri::command]
+async fn pick_folder_dialog(app: AppHandle) -> Result<Option<String>, String> {
+    android_storage::pick_folder(&app)
 }
 
 #[tauri::command]
-async fn exchange_code_for_token(code: String) -> Result<serde_json::Value, String> {
+fn get_platform() -> &'static str {
+    if cfg!(target_os = "android") { "android" } else { "desktop" }
+}
+
+#[tauri::command]
+async fn exchange_code_for_token(code: String, state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    if code.trim().is_empty() { return Err("Dropbox 인증 코드를 입력해주세요.".to_owned()); }
+    let _ = &state;
     let client = Client::new();
+    #[allow(unused_mut)]
+    let mut form = vec![
+        ("code", code.trim().to_owned()),
+        ("grant_type", "authorization_code".to_owned()),
+        ("client_id", get_app_key()),
+    ];
+    #[cfg(desktop)]
+    {
+        form.push(("client_secret", get_app_secret()));
+        form.push(("redirect_uri", "http://localhost:8421/callback".to_owned()));
+    }
+    #[cfg(target_os = "android")]
+    {
+        let verifier = state.oauth_verifier.lock().map_err(|e| e.to_string())?.clone()
+            .ok_or("Dropbox 연결을 다시 시작해주세요.")?;
+        form.push(("code_verifier", verifier));
+    }
     let res = client.post("https://api.dropboxapi.com/oauth2/token")
-        .form(&[
-            ("code", code.as_str()), 
-            ("grant_type", "authorization_code"), 
-            ("client_id", get_app_key().as_str()), 
-            ("client_secret", get_app_secret().as_str()), 
-            ("redirect_uri", "http://localhost:8421/callback")
-        ])
+        .form(&form)
         .send().await.map_err(|e| e.to_string())?;
     
     if res.status().is_success() {
         let token_data: TokenResponse = res.json().await.map_err(|e| e.to_string())?;
+        #[cfg(target_os = "android")]
+        { state.oauth_verifier.lock().map_err(|e| e.to_string())?.take(); }
         Ok(serde_json::json!({
             "access_token": token_data.access_token,
             "refresh_token": token_data.refresh_token
@@ -298,32 +363,6 @@ async fn list_dropbox_files(client: &Client, token: &str, path: &str) -> Result<
     }
 }
 
-async fn get_local_files_recursive(base_path: &std::path::Path, current_path: &std::path::Path) -> Vec<(String, PathBuf)> {
-    let mut files = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(current_path).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().to_string();
-            if file_name.eq_ignore_ascii_case(".DS_Store") { continue; }
-            if path.is_dir() {
-                let sub_files = Box::pin(get_local_files_recursive(base_path, &path)).await;
-                files.extend(sub_files);
-            } else {
-                if let Ok(rel_path) = path.strip_prefix(base_path) {
-                    if let Some(rel_str) = rel_path.to_str() {
-                        // 윈도우 경로 구분자를 슬래시로 통일
-                        let normalized = rel_str.replace("\\", "/");
-                        if !normalized.to_lowercase().ends_with(".ds_store") {
-                            files.push((normalized, path));
-                        }
-                    }
-                }
-            }
-        }
-    }
-    files
-}
-
 async fn create_dropbox_folder(client: &Client, token: &str, path: &str) -> Result<(), String> {
     let res = client.post("https://api.dropboxapi.com/2/files/create_folder_v2")
         .header(AUTHORIZATION, format!("Bearer {}", token))
@@ -342,7 +381,7 @@ async fn create_dropbox_folder(client: &Client, token: &str, path: &str) -> Resu
     }
 }
 
-async fn upload_to_dropbox(client: &Client, token: &str, local_file: PathBuf, remote_path: String) -> Result<(), String> {
+async fn upload_to_dropbox(app: &AppHandle, client: &Client, token: &str, local_file: LocalFile, remote_path: String) -> Result<(), String> {
     // 폴더 경로 추출 및 생성 시도 (업로드할 파일이 있는 폴더)
     if let Some(parent_path) = std::path::Path::new(&remote_path).parent() {
         if let Some(parent_str) = parent_path.to_str() {
@@ -353,22 +392,24 @@ async fn upload_to_dropbox(client: &Client, token: &str, local_file: PathBuf, re
         }
     }
 
-    let contents = tokio::fs::read(&local_file).await.map_err(|e| e.to_string())?;
+    let contents = local_file.read(app).await?;
     client.post("https://content.dropboxapi.com/2/files/upload")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header(CONTENT_TYPE, "application/octet-stream")
         .header("Dropbox-API-Arg", serde_json::to_string(&serde_json::json!({"path": remote_path, "mode": "overwrite", "mute": true})).unwrap())
-        .body(contents).send().await.map_err(|e| e.to_string())?;
+        .body(contents).send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?;
     Ok(())
 }
 
-async fn download_from_dropbox(client: &Client, token: &str, remote_path: String, local_file: PathBuf) -> Result<(), String> {
+async fn download_from_dropbox(app: &AppHandle, client: &Client, token: &str, remote_path: String, local_file: LocalFile) -> Result<(), String> {
     let res = client.post("https://content.dropboxapi.com/2/files/download")
         .header(AUTHORIZATION, format!("Bearer {}", token))
         .header("Dropbox-API-Arg", serde_json::to_string(&serde_json::json!({"path": remote_path})).unwrap())
-        .send().await.map_err(|e| e.to_string())?;
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?;
     let contents = res.bytes().await.map_err(|e| e.to_string())?;
-    tokio::fs::write(&local_file, contents).await.map_err(|e| e.to_string())?;
+    local_file.write(app, &contents).await?;
     Ok(())
 }
 
@@ -448,8 +489,8 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
             return Ok(SyncResult { success: false, message: "동기화가 취소되었습니다.".to_string() });
         }
         
-        let local_dir = PathBuf::from(&items[i].local_path);
-        if !local_dir.exists() { let _ = tokio::fs::create_dir_all(&local_dir).await; }
+        let local_dir = &items[i].local_path;
+        storage::ensure_folder(&app, local_dir).await?;
         
         let mut remote_rel_paths = HashSet::new();
         for remote_file in remote_files {
@@ -470,29 +511,24 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
             
             remote_rel_paths.insert(rel_path.clone());
             
-            // OS별 경로 구분자 처리: Windows는 \로 변환, macOS/Linux는 / 그대로 사용
-            #[cfg(windows)]
-            let local_path = local_dir.join(rel_path.replace("/", "\\"));
-            #[cfg(not(windows))]
-            let local_path = local_dir.join(&rel_path);
+            let local_path = LocalFile::new(local_dir, &rel_path)?;
             
             let remote_hash = remote_file.content_hash.clone().unwrap_or_default();
             
-            if !local_path.exists() {
+            let local_modified = local_path.modified(&app).await?;
+            if local_modified.is_none() {
                 println!("[Sync] 신규 다운로드 감지: {}", rel_path);
                 let _ = app.emit("sync-log", format!("[다운로드 감지] '{}' (클라우드 신규 파일)", rel_path));
                 total_tasks.push(("down", current_token.clone(), remote_path, local_path, rel_path));
             } else {
-                let local_hash = compute_dropbox_hash(&local_path).await;
+                let local_hash = compute_dropbox_hash(&app, &local_path).await?;
                 if local_hash != remote_hash {
                     let remote_modified_str = remote_file.server_modified.as_deref().unwrap_or("");
                     let remote_modified = DateTime::parse_from_rfc3339(remote_modified_str)
                         .map(|dt| dt.with_timezone(&Utc))
                         .map_err(|e| format!("서버 시간 파싱 실패: {}", e))?;
                         
-                    if let Ok(metadata) = tokio::fs::metadata(&local_path).await {
-                        if let Ok(modified) = metadata.modified() {
-                            let local_modified: DateTime<Utc> = modified.into();
+                    if let Some(local_modified) = local_modified {
                             println!("[Sync] 해시 불일치 ({}): 로컬={}, 서버={}", rel_path, local_modified, remote_modified);
                             if remote_modified > local_modified {
                                 let _ = app.emit("sync-log", format!("[다운로드 감지] '{}' (클라우드 데이터가 최신)", rel_path));
@@ -501,7 +537,6 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
                                 let _ = app.emit("sync-log", format!("[업로드 감지] '{}' (로컬 데이터가 최신)", rel_path));
                                 total_tasks.push(("up", current_token.clone(), remote_path, local_path, rel_path));
                             }
-                        }
                     }
                 } else {
                     println!("[Sync] 파일 일치 (해시 동일): {}", rel_path);
@@ -511,10 +546,10 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         }
 
         // 로컬 파일 재귀 스캔
-        let local_files = get_local_files_recursive(&local_dir, &local_dir).await;
+        let local_files = storage::list_files(&app, local_dir).await?;
         for (rel_path, path) in local_files {
             if !remote_rel_paths.contains(&rel_path) {
-                let remote_path = format!("{}/{}", items[i].cloud_path.trim_end_matches('/'), rel_path);
+                let remote_path = format!("{}/{}", cloud_path_normalized.trim_end_matches('/'), rel_path);
                 total_tasks.push(("up", current_token.clone(), remote_path, path, rel_path));
             }
         }
@@ -535,6 +570,7 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
 
     let app_arc = Arc::new(app);
     let client_arc = Arc::new(client);
+    let transfer_errors = Arc::new(Mutex::new(Vec::new()));
 
     for (action, token, remote_path, local_path, file_name) in total_tasks {
         if state.cancel_sync.load(Ordering::SeqCst) {
@@ -544,19 +580,17 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         let client = client_arc.clone();
         let app = app_arc.clone();
         let pc = processed_count.clone();
+        let errors = transfer_errors.clone();
         
         worker_tasks.push(async move {
             let res = if action == "up" {
-                upload_to_dropbox(&client, &token, local_path, remote_path).await
+                upload_to_dropbox(&app, &client, &token, local_path, remote_path).await
             } else {
-                // 다운로드 시 부모 디렉토리 생성 보장
-                if let Some(parent) = local_path.parent() {
-                    let _ = tokio::fs::create_dir_all(parent).await;
-                }
-                download_from_dropbox(&client, &token, remote_path, local_path).await
+                download_from_dropbox(&app, &client, &token, remote_path, local_path).await
             };
             
             if let Err(ref e) = res {
+                errors.lock().unwrap().push(format!("{}: {}", file_name, e));
                 println!("[Sync Error] {} 처리 중 오류: {}", file_name, e);
                 let _ = app.emit("sync-log", format!("[처리 오류] '{}': {}", file_name, e));
             } else {
@@ -583,6 +617,11 @@ async fn sync_folders(app: AppHandle, state: State<'_, AppState>, mut items: Vec
         println!("[DEBUG] 동기화 중단 완료, 이벤트 발송");
         let _ = app_arc.emit("sync-complete", serde_json::json!({ "success": false, "message": "동기화가 중단되었습니다." }));
         Ok(SyncResult { success: false, message: "동기화가 중단되었습니다.".to_string() })
+    } else if !transfer_errors.lock().unwrap().is_empty() {
+        let errors = transfer_errors.lock().unwrap();
+        let message = format!("{}개 파일 동기화 실패: {}", errors.len(), errors.iter().take(3).cloned().collect::<Vec<_>>().join("; "));
+        let _ = app_arc.emit("sync-complete", serde_json::json!({ "success": false, "message": &message }));
+        Err(message)
     } else {
         println!("[DEBUG] 동기화 성공 완료, 이벤트 발송");
         let _ = app_arc.emit("sync-complete", serde_json::json!({ "success": true, "message": format!("동기화 완료 ({}개의 파일 처리)", total_count) }));
@@ -648,13 +687,19 @@ async fn delete_dropbox_folder(path: String, token: String, refresh_token: Optio
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
-        .setup(|app| {
+        .plugin(tauri_plugin_process::init());
+    #[cfg(target_os = "android")]
+    let builder = builder.plugin(android_storage::init());
+    builder.setup(|app| {
+            let _ = &app;
+            #[cfg(desktop)]
             if let Some(main_window) = app.get_webview_window("main") {
                 let icon_bytes = include_bytes!("../icons/32x32.png");
                 if let Ok(icon) = tauri::image::Image::from_bytes(icon_bytes) {
@@ -670,7 +715,8 @@ pub fn run() {
             pick_folder_dialog, 
             exchange_code_for_token, 
             list_dropbox_folders,
-            delete_dropbox_folder
+            delete_dropbox_folder,
+            get_platform
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

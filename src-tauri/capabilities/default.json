@@ -6,9 +6,6 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "dialog:default",
-    "updater:allow-check",
-    "updater:allow-download-and-install",
-    "process:allow-restart"
+    "dialog:default"
   ]
 }

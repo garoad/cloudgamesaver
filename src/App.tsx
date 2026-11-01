@@ -19,6 +19,12 @@ export default function App() {
   const [items, setItems] = useState<SyncItem[]>([]);
   const [dropboxToken, setDropboxToken] = useState("");
   const [refreshToken, setRefreshToken] = useState<string | null>(null);
+  const [platform, setPlatform] = useState<"android" | "desktop" | null>(null);
+  const isAndroid = platform === "android";
+  const [showAuthCode, setShowAuthCode] = useState(false);
+  const [authCode, setAuthCode] = useState("");
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [status, setStatus] = useState("");
   const [loading, setLoading] = useState(false);
   const [isUpdating, setIsUpdating] = useState(false);
@@ -70,7 +76,7 @@ export default function App() {
 
   // 업데이트 확인 로직
   const checkForUpdates = async (manual = false, retryCount = 0) => {
-    if (loading) return;
+    if (loading || platform !== "desktop") return;
     
     const MAX_RETRIES = 3;
     const RETRY_DELAY = 2000;
@@ -173,14 +179,7 @@ export default function App() {
   useEffect(() => {
     addLog("CloudGameSaver 앱이 실행되었습니다.");
 
-    if (!hasCheckedUpdate.current) {
-      hasCheckedUpdate.current = true;
-      setTimeout(() => checkForUpdates(false), 2000);
-    }
-    
-    const updateInterval = setInterval(() => {
-      checkForUpdates(false);
-    }, 30 * 60 * 1000);
+    invoke<"android" | "desktop">("get_platform").then(setPlatform).catch(console.error);
 
     const saved = localStorage.getItem("sync-items");
     const token = localStorage.getItem("dropbox-token");
@@ -267,7 +266,6 @@ export default function App() {
     });
 
     return () => {
-      clearInterval(updateInterval);
       unConnect.then(f => f());
       unTokenUpdated.then(f => f());
       unProgress.then(f => f());
@@ -275,6 +273,20 @@ export default function App() {
       unSyncComplete.then(f => f());
     };
   }, []);
+
+  useEffect(() => {
+    if (platform !== "desktop") return;
+    let startupTimeout: ReturnType<typeof setTimeout> | undefined;
+    if (!hasCheckedUpdate.current) {
+      hasCheckedUpdate.current = true;
+      startupTimeout = setTimeout(() => checkForUpdates(false), 2000);
+    }
+    const updateInterval = setInterval(() => checkForUpdates(false), 30 * 60 * 1000);
+    return () => {
+      if (startupTimeout) clearTimeout(startupTimeout);
+      clearInterval(updateInterval);
+    };
+  }, [platform]);
 
   // 풀로그 모달 자동 스크롤
   useEffect(() => {
@@ -339,9 +351,44 @@ export default function App() {
     updateStatusAndLog("드롭박스 인증 진행 중...");
     try { 
       await invoke("open_auth_url"); 
+      if (isAndroid) {
+        setAuthCode("");
+        setAuthError("");
+        setShowAuthCode(true);
+      }
     } catch (e) { 
       updateStatusAndLog("인증 에러: " + e); 
     }
+  };
+
+  const submitAuthCode = async () => {
+    if (!authCode.trim() || authSubmitting) return;
+    setAuthSubmitting(true);
+    setAuthError("");
+    try {
+      const res = await invoke<{ access_token: string; refresh_token: string | null }>("exchange_code_for_token", { code: authCode.trim() });
+      setDropboxToken(res.access_token);
+      setRefreshToken(res.refresh_token);
+      localStorage.setItem("dropbox-token", res.access_token);
+      if (res.refresh_token) localStorage.setItem("dropbox-refresh-token", res.refresh_token);
+      setShowAuthCode(false);
+      setAuthCode("");
+      updateStatusAndLog("드롭박스 연결 성공!");
+      await fetchCloudFolders(res.access_token);
+    } catch (error) {
+      setAuthError(String(error));
+      updateStatusAndLog("드롭박스 연결 실패: " + error);
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const folderLabel = (path: string) => {
+    if (!path.startsWith("content://")) return path;
+    try {
+      const documentId = decodeURIComponent(path.split("/tree/")[1] || "");
+      return documentId.replace(/^[^:]+:/, "") || "선택한 세이브 폴더";
+    } catch { return "선택한 세이브 폴더"; }
   };
 
   const toggleItem = (index: number) => {
@@ -538,7 +585,7 @@ export default function App() {
   const activeCount = items.filter(i => i.enabled && i.local_path).length;
 
   return (
-    <div className="app-layout">
+    <div className={`app-layout ${isAndroid ? "android-layout" : ""}`}>
       {/* 로딩 오버레이 */}
       {loading && (
         <div className="loading-overlay">
@@ -575,7 +622,7 @@ export default function App() {
         <div className="brand-header">
           <div className="brand-title-row">
             <h1>CloudGameSaver</h1>
-            <span className="version-badge">v0.2.1</span>
+            <span className="version-badge">v0.2.2</span>
           </div>
           <p className="subtitle">드롭박스 세이브파일 완벽 동기화</p>
         </div>
@@ -583,16 +630,16 @@ export default function App() {
         <div className="sidebar-section">
           <div className="section-title">⚙️ 설정 및 연결</div>
           <div className="button-group-vertical">
-            <button onClick={handleConnect} className={`auth-btn ${dropboxToken ? 'connected' : ''}`}>
+            <button onClick={handleConnect} disabled={loading || platform === null} className={`auth-btn ${dropboxToken ? 'connected' : ''}`}>
               {dropboxToken ? "✅ 드롭박스 연결됨" : "🔗 드롭박스 계정 연결"}
             </button>
-            <button 
-              onClick={() => checkForUpdates(true)} 
+            {platform === "desktop" && <button
+              onClick={() => checkForUpdates(true)}
               disabled={loading} 
               className="secondary-action-btn"
             >
               🔄 업데이트 확인
-            </button>
+            </button>}
           </div>
         </div>
 
@@ -650,8 +697,8 @@ export default function App() {
             <div className="folder-select-row">
               <input 
                 readOnly 
-                placeholder="PC의 세이브 폴더 경로" 
-                value={manualLocalPath} 
+                placeholder={isAndroid ? "세이브 폴더를 선택해주세요" : "PC의 세이브 폴더 경로"}
+                value={folderLabel(manualLocalPath)}
                 className="form-input path-input"
               />
               <button onClick={() => pickLocalFolder()} className="secondary-btn">
@@ -666,6 +713,7 @@ export default function App() {
               등록하기
             </button>
           </div>
+          {isAndroid && <p className="storage-note">에뮬레이터에서 세이브 위치를 공유 폴더로 지정한 뒤 같은 폴더를 선택해주세요. 동기화가 끝날 때까지 앱을 열어두세요.</p>}
         </section>
 
         {/* 게임 리스트 영역 */}
@@ -713,7 +761,7 @@ export default function App() {
                       <div className="path-tags">
                         <span className="tag cloud-tag">Cloud: {item.cloud_path}</span>
                         <span className={`tag local-tag ${item.local_path ? '' : 'warn'}`}>
-                          Local: {item.local_path || "⚠️ 로컬 폴더 연결 안 됨"}
+                          Local: {folderLabel(item.local_path) || "⚠️ 로컬 폴더 연결 안 됨"}
                         </span>
                       </div>
                     </div>
@@ -793,6 +841,25 @@ export default function App() {
         </div>
       )}
 
+      {showAuthCode && (
+        <div className="modal-overlay">
+          <form className="modal-card" onSubmit={event => { event.preventDefault(); void submitAuthCode(); }}>
+            <div className="modal-header"><h3>Dropbox 연결 완료하기</h3></div>
+            <div className="modal-body">
+              <p>브라우저에서 Dropbox 연결을 승인하고, 표시된 인증 코드를 복사해 여기에 입력해주세요.</p>
+              <label className="input-label" htmlFor="dropbox-auth-code">인증 코드</label>
+              <input id="dropbox-auth-code" autoComplete="off" autoCapitalize="none" spellCheck={false}
+                value={authCode} onChange={event => setAuthCode(event.target.value)} className="form-input" disabled={authSubmitting} />
+              {authError && <p className="auth-error" role="alert">{authError}</p>}
+            </div>
+            <div className="modal-footer">
+              <button type="button" className="secondary-btn" disabled={authSubmitting} onClick={() => { setShowAuthCode(false); setAuthCode(""); }}>취소</button>
+              <button type="submit" className="primary-modal-btn" disabled={!authCode.trim() || authSubmitting}>{authSubmitting ? "연결 중..." : "연결하기"}</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {/* 편집 모달 */}
       {editingIndex !== null && (
         <div className="modal-overlay" onClick={() => setEditingIndex(null)}>
@@ -813,7 +880,7 @@ export default function App() {
               <div className="folder-select-row">
                 <input 
                   readOnly
-                  value={editLocalPath} 
+                  value={folderLabel(editLocalPath)}
                   placeholder="로컬 폴더 경로"
                   className="form-input path-input"
                 />

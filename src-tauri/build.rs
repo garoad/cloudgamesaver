@@ -1,6 +1,8 @@
 fn main() {
     // 프로젝트 루트에 있는 .env 파일을 읽어서 환경 변수로 설정합니다.
     println!("cargo:rerun-if-changed=../.env");
+    println!("cargo:rerun-if-env-changed=APP_KEY");
+    println!("cargo:rerun-if-env-changed=APP_SECRET");
     let _ = dotenvy::from_path("../.env");
     
     // 환경 변수가 존재하면 Rust 컴파일러에게 전달하여 
@@ -11,10 +13,12 @@ fn main() {
         println!("cargo:warning=APP_KEY is not set in .env file");
     }
     
-    if let Ok(secret) = std::env::var("APP_SECRET") {
-        println!("cargo:rustc-env=APP_SECRET={}", secret);
-    } else {
-        println!("cargo:warning=APP_SECRET is not set in .env file");
+    if !std::env::var("TARGET").unwrap_or_default().contains("android") {
+        if let Ok(secret) = std::env::var("APP_SECRET") {
+            println!("cargo:rustc-env=APP_SECRET={}", secret);
+        } else {
+            println!("cargo:warning=APP_SECRET is not set in .env file");
+        }
     }
 
     tauri_build::build()
